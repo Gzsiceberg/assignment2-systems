@@ -111,6 +111,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
                 torch.cuda.synchronize()  
             end = timer()
             opt_step_times.append(end - start)
+        else:
+            llm.zero_grad()
 
     all_result["type"].append(description)
     mean, std = np.mean(forward_times) * 1000, np.std(forward_times) * 1000
@@ -166,5 +168,6 @@ if __name__ == "__main__":
     if args.all >= 5:
         benchmark_llm("2.7B", all_results, d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
 
-    df = pd.DataFrame(all_results)
-    df.to_markdown(args.output, index=False)
+    if args.output:
+        df = pd.DataFrame(all_results)
+        df.to_markdown(args.output, index=False)
