@@ -1,4 +1,5 @@
 
+from contextlib import nullcontext
 import gc
 from timeit import default_timer as timer
 from typing import Callable
@@ -42,6 +43,7 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
 
     warmup_runs = args.warmup
     num_trials = args.trials
+    has_autocast = args.autocast
     has_opt = args.opt
     has_back = args.back
     vocab_size: int = 100_00
@@ -68,7 +70,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
     print(f"Benchmarking {description} model with {total_params/1e6:.1f}M parameters context_length={context_length}")
 
     for _ in range(warmup_runs):
-        logits = llm(input_ids)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if has_autocast else nullcontext():
+            logits = llm(input_ids)
         loss = cross_entropy(logits, targets)
         if has_back:
             loss.backward()
@@ -87,7 +90,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
     for _ in range(num_trials):
         start = timer()
         with nvtx.range(f"{description}_forward"):
-            logits = llm(input_ids)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if has_autocast else nullcontext():
+                logits = llm(input_ids)
             loss = cross_entropy(logits, targets)
         if torch.cuda.is_available():
             torch.cuda.synchronize()  
@@ -119,13 +123,15 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
 
     all_result["type"].append(description)
     mean, std = np.mean(forward_times) * 1000, np.std(forward_times) * 1000
-    print(f"{description} forward: mean={mean:.2f}ms std={std:.2f}ms")
+    min_time, max_time = np.min(forward_times) * 1000, np.max(forward_times) * 1000
+    print(f"{description} forward: mean={mean:.2f}ms std={std:.2f}ms min={min_time:.2f}ms max={max_time:.2f}ms")
     all_result["mean_forward"].append(mean)
     all_result["std_forward"].append(std)
 
     if has_back:
         mean2, std2 = np.mean(backward_times) * 1000, np.std(backward_times) * 1000
-        print(f"{description} backward: mean={mean2:.2f}ms std={std2:.2f}ms")
+        min_time2, max_time2 = np.min(backward_times) * 1000, np.max(backward_times) * 1000
+        print(f"{description} backward: mean={mean2:.2f}ms std={std2:.2f}ms min={min_time2:.2f}ms max={max_time2:.2f}ms")
         all_result["mean_backward"].append(mean2)
         all_result["std_backward"].append(std2)
 
@@ -147,6 +153,7 @@ if __name__ == "__main__":
     parser.add_argument("--back", action="store_true", help="Include optimizer step in benchmark")
     parser.add_argument("--context-length", type=int, default=128, help="Context length")
     parser.add_argument("-o", "--output", type=str, default="benchmark_results.md", help="Output markdown file")
+    parser.add_argument("--autocast", action="store_true", help="Use autocast for mixed precision")
     args = parser.parse_args()
 
     cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
