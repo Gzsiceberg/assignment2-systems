@@ -74,7 +74,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
             logits = llm(input_ids)
         loss = cross_entropy(logits, targets)
         if has_back:
-            loss.backward()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if has_autocast else nullcontext():
+                loss.backward()
         if has_opt:
             opt.step()
             opt.zero_grad()
@@ -101,7 +102,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
         if has_back:
             start = timer()
             with nvtx.range(f"{description}_backward"):
-                loss.backward()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if has_autocast else nullcontext():
+                    loss.backward()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()  
             end = timer()
