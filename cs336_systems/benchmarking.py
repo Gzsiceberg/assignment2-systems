@@ -6,8 +6,9 @@ import torch
 import numpy as np
 import torch.cuda.nvtx as nvtx
 
+from cs336_basics.model import annotated_scaled_dot_product_attention
 from cs336_basics.optimizer import AdamW
-
+import cs336_basics.model
 
 def benchmark(description: str, run: Callable, num_warmups: int = 1, num_trials: int = 3) -> tuple[float, float]:
     """Benchmark `func` by running it `num_trials`, and return all the times."""
@@ -148,6 +149,8 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", type=str, default="benchmark_results.md", help="Output markdown file")
     args = parser.parse_args()
 
+    cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
     all_results = {}
     all_results["type"] = []
     all_results["mean_forward"] = []
@@ -173,3 +176,4 @@ if __name__ == "__main__":
     if args.output:
         df = pd.DataFrame(all_results)
         df.to_markdown(args.output, index=False)
+    
