@@ -31,7 +31,7 @@ def benchmark(description: str, run: Callable, num_warmups: int = 1, num_trials:
     print(f"{description}: mean={mean_time:.2f}ms std={std_time:.2f}ms")
     return mean_time, std_time
 
-def benchmark_llm(description: str, num_layers: int = 12, d_model: int = 768, num_heads: int = 12, d_ff: int = 4 * 768):
+def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_model: int = 768, num_heads: int = 12, d_ff: int = 4 * 768):
     from cs336_basics import model
     from cs336_basics.nn_utils import cross_entropy
     warmup_runs = args.warmup
@@ -67,6 +67,9 @@ def benchmark_llm(description: str, num_layers: int = 12, d_model: int = 768, nu
         if has_opt:
             opt.step()
             opt.zero_grad()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -79,14 +82,14 @@ def benchmark_llm(description: str, num_layers: int = 12, d_model: int = 768, nu
             logits = llm(input_ids)
             loss = cross_entropy(logits, targets)
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
+            torch.cuda.synchronize()  
         end = timer()
         forward_times.append(end - start)
 
         with nvtx.range(f"{description}_backward"):
             loss.backward()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
+            torch.cuda.synchronize()  
         end2 = timer()
         backward_times.append(end2 - end)
 
@@ -95,20 +98,26 @@ def benchmark_llm(description: str, num_layers: int = 12, d_model: int = 768, nu
                 opt.step()
                 opt.zero_grad()
             if torch.cuda.is_available():
-                torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
+                torch.cuda.synchronize()  
             end3 = timer()
             opt_step_times.append(end3 - end2)
         
+    all_result["type"].append(description)
     mean, std = np.mean(forward_times) * 1000, np.std(forward_times) * 1000
     print(f"{description} forward: mean={mean:.2f}ms std={std:.2f}ms")
+    all_result["mean_forward"].append(mean)
+    all_result["std_forward"].append(std)
 
     mean2, std2 = np.mean(backward_times) * 1000, np.std(backward_times) * 1000
     print(f"{description} backward: mean={mean2:.2f}ms std={std2:.2f}ms")
+    all_result["mean_backward"].append(mean2)
+    all_result["std_backward"].append(std2)
 
     if has_opt:
         mean3, std3 = np.mean(opt_step_times) * 1000, np.std(opt_step_times) * 1000
         print(f"{description} opt_step: mean={mean3:.2f}ms std={std3:.2f}ms")
-    return (mean, std), (mean2, std2)
+        all_result["mean_opt_step"].append(mean3)
+        all_result["std_opt_step"].append(std3)
 
 
 if __name__ == "__main__":
@@ -120,50 +129,25 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--trials", type=int, default=10, help="Number of benchmark trials")
     parser.add_argument("--opt", action="store_true", help="Include optimizer step in benchmark")
     parser.add_argument("--context-length", type=int, default=128, help="Context length")
+    parser.add_argument("-o", "--output", type=str, default="benchmark_results.md", help="Output markdown file")
     args = parser.parse_args()
 
     all_results = {}
     all_results["type"] = []
     all_results["mean_forward"] = []
     all_results["std_forward"] = []
-    all_results["mean_forward_backward"] = []
-    all_results["std_forward_backward"] = []
+    all_results["mean_backward"] = []
+    all_results["std_backward"] = []
+    if args.opt:
+        all_results["mean_opt_step"] = []
+        all_results["std_opt_step"] = []
 
-    (mean, std), (mean2, std2) = benchmark_llm("small", d_model=768, d_ff=4 * 768, num_layers=12, num_heads=12)
-    all_results["type"].append("small")
-    all_results["mean_forward"].append(mean)
-    all_results["std_forward"].append(std)
-    all_results["mean_forward_backward"].append(mean2)
-    all_results["std_forward_backward"].append(std2)
-
-    (mean, std), (mean2, std2) = benchmark_llm("medium", d_model=1024, d_ff=4 * 1024, num_layers=24, num_heads=16)
-    all_results["type"].append("medium")
-    all_results["mean_forward"].append(mean)
-    all_results["std_forward"].append(std)
-    all_results["mean_forward_backward"].append(mean2)
-    all_results["std_forward_backward"].append(std2)
-
-    (mean, std), (mean2, std2) = benchmark_llm("large", d_model=1280, d_ff=4 * 1280, num_layers=36, num_heads=20)
-    all_results["type"].append("large")
-    all_results["mean_forward"].append(mean)
-    all_results["std_forward"].append(std)
-    all_results["mean_forward_backward"].append(mean2)
-    all_results["std_forward_backward"].append(std2)
-
+    benchmark_llm("small", all_results, d_model=768, d_ff=4 * 768, num_layers=12, num_heads=12)
+    benchmark_llm("medium", all_results, d_model=1024, d_ff=4 * 1024, num_layers=24, num_heads=16)
+    benchmark_llm("large", all_results, d_model=1280, d_ff=4 * 1280, num_layers=36, num_heads=20)
     if args.all:
-        (mean, std), (mean2, std2) = benchmark_llm("xlarge", d_model=1600, d_ff=4 * 1600, num_layers=48, num_heads=25)
-        all_results["type"].append("xlarge")
-        all_results["mean_forward"].append(mean)
-        all_results["std_forward"].append(std)
-        all_results["mean_forward_backward"].append(mean2)
-        all_results["std_forward_backward"].append(std2)
-
-        (mean, std), (mean2, std2) = benchmark_llm("2.7B", d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
-        all_results["type"].append("2.7B")
-        all_results["mean_forward"].append(mean)
-        all_results["std_forward"].append(std)
-        all_results["mean_forward_backward"].append(mean2)
-        all_results["std_forward_backward"].append(std2)
+        benchmark_llm("xlarge", all_results, d_model=1600, d_ff=4 * 1600, num_layers=48, num_heads=25)
+        benchmark_llm("2.7B", all_results, d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
 
     df = pd.DataFrame(all_results)
-    df.to_markdown("benchmark_results.md", index=False)
+    df.to_markdown(args.output, index=False)
