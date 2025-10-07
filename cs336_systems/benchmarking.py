@@ -113,6 +113,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
             opt_step_times.append(end - start)
         else:
             llm.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()  
 
     all_result["type"].append(description)
     mean, std = np.mean(forward_times) * 1000, np.std(forward_times) * 1000
