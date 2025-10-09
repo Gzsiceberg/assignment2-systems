@@ -186,7 +186,6 @@ def benchmark_demo(size, provider):
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
-
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
@@ -201,6 +200,23 @@ def matmul_kernel(
     m_pid = tl.program_id(0)
     n_pid = tl.program_id(1)
 
+    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
+                           a_row_stride, a_col_stride, 
+                           b_row_stride, b_col_stride, 
+                           c_row_stride, c_col_stride, 
+                           BLOCK_M, BLOCK_N, BLOCK_K, 
+                           m_pid, n_pid)
+
+@triton.jit
+def matmul_kernel_internal(A_ptr, B_ptr, C_ptr, 
+                           M, N, K, 
+                           a_row_stride, a_col_stride, 
+                           b_row_stride, b_col_stride, 
+                           c_row_stride, c_col_stride, 
+                           BLOCK_M: tl.constexpr,
+                           BLOCK_N: tl.constexpr,
+                           BLOCK_K: tl.constexpr,
+                           m_pid, n_pid):
     c_mat = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     block_m_offsets = tl.arange(0, BLOCK_M)
     block_n_offsets = tl.arange(0, BLOCK_N)
@@ -230,6 +246,73 @@ def matmul_kernel(
     tl.store(c_ptrs, c_mat, mask=c_mask)
 
 
+
+@triton.jit
+def matmul_kernel_l2_cache(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    a_row_stride, a_col_stride,
+    b_row_stride, b_col_stride,
+    c_row_stride, c_col_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    group_pid = tl.program_id(0)
+    n_pid = tl.program_id(1)
+    group_row_pid = tl.program_id(2)
+    m_pid = group_pid * GROUP_M + group_row_pid
+
+    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
+                        a_row_stride, a_col_stride, 
+                        b_row_stride, b_col_stride, 
+                        c_row_stride, c_col_stride, 
+                        BLOCK_M, BLOCK_N, BLOCK_K, 
+                        m_pid, n_pid)
+
+
+@triton.jit
+def matmul_kernel_l2_cache_v2(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    a_row_stride, a_col_stride,
+    b_row_stride, b_col_stride,
+    c_row_stride, c_col_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # Program ID
+    pid = tl.program_id(axis=0)
+    # Number of program ids along the M axis
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    # Number of programs ids along the N axis
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    # Number of programs in group
+    num_pid_in_group = GROUP_M * num_pid_n
+    # Id of the group this program is in
+    group_id = pid // num_pid_in_group
+    # Row-id of the first program in the group
+    first_pid_m = group_id * GROUP_M
+    # If `num_pid_m` isn't divisible by `GROUP_SIZE_M`, the last group is smaller
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    # *Within groups*, programs are ordered in a column-major order
+    in_group_id = pid % num_pid_in_group
+    # Row-id of the program in the *launch grid*
+    m_pid = first_pid_m + ((in_group_id) % group_size_m)
+    # Col-id of the program in the *launch grid*
+    n_pid = (in_group_id) // group_size_m
+
+    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
+                        a_row_stride, a_col_stride, 
+                        b_row_stride, b_col_stride, 
+                        c_row_stride, c_col_stride, 
+                        BLOCK_M, BLOCK_N, BLOCK_K, 
+                        m_pid, n_pid)
+
+
 def triton_matmul(A: Tensor, B: Tensor) -> Tensor:
     C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
     BLOCK_M = 64
@@ -253,9 +336,62 @@ def triton_matmul(A: Tensor, B: Tensor) -> Tensor:
     )
     return C
 
+def triton_matmul_l2_cache(A: Tensor, B: Tensor) -> Tensor:
+    C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    GROUP_M = 4
+
+    M = A.shape[0]
+    N = B.shape[0]
+    K = A.shape[1]
+    assert A.shape[1] == B.shape[1], "Incompatible matrix shapes"
+
+    group_num = triton.cdiv(M, BLOCK_M * GROUP_M)
+    col_blocks = triton.cdiv(N, BLOCK_N)
+
+    grid = (group_num, col_blocks, GROUP_M)
+
+    matmul_kernel_l2_cache[grid](
+        A_ptr=A, B_ptr=B, C_ptr=C,
+        M=M, N=N, K=K,
+        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+    )
+    return C
+
+def triton_matmul_l2_cache_v2(A: Tensor, B: Tensor) -> Tensor:
+    C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    GROUP_M = 4
+
+    M = A.shape[0]
+    N = B.shape[0]
+    K = A.shape[1]
+    assert A.shape[1] == B.shape[1], "Incompatible matrix shapes"
+
+    grid = (triton.cdiv(N, BLOCK_N) * triton.cdiv(M, BLOCK_M),)
+
+    matmul_kernel_l2_cache_v2[grid](
+        A_ptr=A, B_ptr=B, C_ptr=C,
+        M=M, N=N, K=K,
+        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+    )
+    return C
+
 
 def matmul_demo():
-    dim = 512 * 5
+    dim = 512 * 10
     M, K, N = dim, dim, dim
     A = torch.rand((M, K), device="cuda", dtype=torch.float32) - 0.5
     B = torch.rand((N, K), device="cuda", dtype=torch.float32) - 0.5
@@ -274,16 +410,28 @@ def matmul_demo():
         num_trials=20,
     )
     benchmark(
+        "Triton MatMul with L2 Cache",
+        lambda: triton_matmul_l2_cache(A, B),
+        num_warmups=5,
+        num_trials=20,
+    )
+    benchmark(
+        "Triton MatMul with L2 Cache v2",
+        lambda: triton_matmul_l2_cache_v2(A, B),
+        num_warmups=5,
+        num_trials=20,
+    )
+    benchmark(
         "Triton MatMul",
         lambda: triton_matmul(A, B),
         num_warmups=5,
         num_trials=20,
     )
 
-    ms01 = triton.testing.do_bench(lambda: torch.matmul(A, B.T), quantiles=[0.5])
-    print(f"PyTorch MatMul (triton.testing): {ms01:.2f}ms")
-    ms02 = triton.testing.do_bench(lambda: triton_matmul(A, B), quantiles=[0.5])
-    print(f"Triton MatMul (triton.testing): {ms02:.2f}ms")
+    # ms01 = triton.testing.do_bench(lambda: torch.matmul(A, B.T), quantiles=[0.5])
+    # print(f"PyTorch MatMul (triton.testing): {ms01:.2f}ms")
+    # ms02 = triton.testing.do_bench(lambda: triton_matmul(A, B), quantiles=[0.5])
+    # print(f"Triton MatMul (triton.testing): {ms02:.2f}ms")
 
 
 if __name__ == "__main__":
