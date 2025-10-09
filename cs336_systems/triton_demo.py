@@ -1,0 +1,88 @@
+import triton
+import triton.language as tl
+import torch
+from torch import Tensor
+from cs336_basics.nn_utils import softmax
+from benchmarking import benchmark, profile
+from rich import print
+
+
+@triton.jit
+def triton_softmax_kernel(
+    x_ptr, y_ptr, x_row_stride, y_row_stride, num_cols, BLOCK_SIZE: tl.constexpr
+):
+    assert num_cols <= BLOCK_SIZE, "num_cols must be less than or equal to BLOCK_SIZE"
+
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    x_start_ptr = x_ptr + row_idx * x_row_stride
+    x_ptrs = x_start_ptr + col_offsets
+    mask = col_offsets < num_cols
+    x_row = tl.load(x_ptrs, mask=mask, other=float("-inf"))
+
+    x_row = x_row - tl.max(x_row, axis=0)
+    x_row_exp = tl.exp(x_row)
+    denom = tl.sum(x_row_exp, axis=0)
+    y_row = x_row_exp / denom
+
+    y_start_ptr = y_ptr + row_idx * y_row_stride
+    y_ptrs = y_start_ptr + col_offsets
+    tl.store(y_ptrs, y_row, mask=mask)
+
+
+def triton_softmax(x: Tensor) -> Tensor:
+    assert x.dim() == 2, "Input must be a 2D tensor"
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    assert x.dtype in [
+        torch.float16,
+        torch.float32,
+    ], "Input must be of type float16 or float32"
+
+    num_rows, num_cols = x.shape
+    y = torch.empty_like(x)
+    block_size = triton.next_power_of_2(num_cols)
+    # print(f"Using block size: {block_size}")
+
+    triton_softmax_kernel[(num_rows,)](
+        x_ptr=x,
+        y_ptr=y,
+        x_row_stride=x.stride(0),
+        y_row_stride=y.stride(0),
+        num_cols=num_cols,
+        BLOCK_SIZE=block_size,
+    )
+
+    return y
+
+
+def softmax_demo():
+    x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).cuda()
+    y1 = softmax(x, dim=-1)
+    y2 = torch.softmax(x, dim=-1)
+    y3 = triton_softmax(x)
+
+    assert torch.allclose(y1, y2, atol=1e-6), f"Results do not match: {y1} vs {y2}"
+    assert torch.allclose(y1, y3, atol=1e-6), f"Results do not match: {y1} vs {y3}"
+
+    dim = 10240
+    x = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
+    benchmark(
+        "PyTorch Softmax",
+        lambda: torch.softmax(x, dim=-1),
+        num_warmups=5,
+        num_trials=20,
+    )
+    benchmark("My Softmax", lambda: softmax(x, dim=-1), num_warmups=5, num_trials=20)
+    benchmark("Triton Softmax", lambda: triton_softmax(x), num_warmups=5, num_trials=20)
+    table = profile("Triton Softmax Profile", lambda: triton_softmax(x))
+    print(table)
+    
+    table = profile(
+        "PyTorch Softmax Profile", lambda: torch.softmax(x, dim=-1)
+    )
+    print(table)
+
+
+if __name__ == "__main__":
+    softmax_demo()
