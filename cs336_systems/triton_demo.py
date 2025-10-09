@@ -96,5 +96,64 @@ def softmax_demo():
     # print(table)
 
 
+@triton.jit
+def vec_add_kernel(x_ptr, y_ptr, z_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offsets < n_elements
+    x_ptrs = x_ptr + offsets
+    y_ptrs = y_ptr + offsets
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    y = tl.load(y_ptrs, mask=mask, other=0.0)
+    z = x + y
+    z_ptrs = z_ptr + offsets
+    tl.store(z_ptrs, z, mask=mask)
+
+def vec_add(x: Tensor, y: Tensor) -> Tensor:
+    z = torch.empty_like(x)
+    n_elements = x.numel()
+    block_size = 1024
+    num_blocks = triton.cdiv(n_elements, block_size)
+
+    vec_add_kernel[(num_blocks,)](
+        x_ptr=x,
+        y_ptr=y,
+        z_ptr=z,
+        n_elements=n_elements,
+        BLOCK_SIZE=block_size,
+    )
+    return z
+    
+
+def vec_add_demo():
+    dim = 1024 * 10000
+    x = torch.randn(dim, device="cuda")
+    y = torch.randn(dim, device="cuda")
+
+    z = x + y  # PyTorch addition
+    z_triton = vec_add(x, y)  # Triton addition
+    assert torch.allclose(z, z_triton), "Results do not match"
+
+    mean_ms = triton.testing.do_bench(lambda: vec_add(x, y), quantiles=[0.5])
+    mean_ms2 = triton.testing.do_bench(lambda: x + y, quantiles=[0.5])
+    print(f"PyTorch Vec Add (triton.testing): {mean_ms2:.2f}ms")
+    print(f"Triton Vec Add (triton.testing): {mean_ms:.2f}ms")
+
+    print("Using benchmarking.py:")
+    benchmark(
+        "PyTorch Vec Add",
+        lambda: x + y,
+        num_warmups=5,
+        num_trials=20,
+    )
+    benchmark(
+        "Triton Vec Add",
+        lambda: vec_add(x, y),
+        num_warmups=5,
+        num_trials=20,
+    )
+
+
 if __name__ == "__main__":
-    softmax_demo()
+    # softmax_demo()
+    vec_add_demo()

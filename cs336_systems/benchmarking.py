@@ -47,10 +47,9 @@ def benchmark(description: str, run: Callable, num_warmups: int = 1, num_trials:
     # Since we will run the kernel multiple times, the timing that matters is steady state.
     for _ in range(num_warmups):
         run()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
     # Time it for real now!
-    total_time = 0.0
     all_time: list[float] = []
     for _ in range(num_trials):
         start = timer()
