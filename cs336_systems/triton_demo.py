@@ -482,9 +482,126 @@ def matmul_demo():
     print("Compiled kernel attributes:")
     for attr in attrs:
         print(f" - {attr}")
+    
+
+@triton.jit
+def layer_norm_fwd_kernel(
+    x_ptr, y_ptr, mean_ptr, rstd_ptr,
+    W_ptr, b_ptr,
+    row_stride, N, eps, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    x_start_ptr = x_ptr + pid * row_stride
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    # compute mean
+    mean = 0.0
+    for k in range(0, N, BLOCK_SIZE):
+        col_ids = k + col_offsets
+        mask = col_ids < N
+        x_ptrs = x_start_ptr + col_ids
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        mean += tl.sum(x, axis=0) / N
+    
+    # compute variance
+    var = 0.0
+    for k in range(0, N, BLOCK_SIZE):
+        col_ids = k + col_offsets
+        mask = col_ids < N
+        x_ptrs = x_start_ptr + col_ids
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x_minus_mean = tl.where(mask, x - mean, 0.0)
+        var += tl.sum(x_minus_mean * x_minus_mean, axis=0) / N
+    
+    mean_ptr = mean_ptr + pid 
+    tl.store(mean_ptr, mean)
+    rstd_ptr = rstd_ptr + pid
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(rstd_ptr, rstd)
+
+    # compute y
+    y_start_ptr = y_ptr + pid * row_stride
+    for k in range(0, N, BLOCK_SIZE):
+        col_ids = k + col_offsets
+        mask = col_ids < N
+        x_ptrs = x_start_ptr + col_ids
+        W_ptrs = W_ptr + col_ids
+        b_ptrs = b_ptr + col_ids
+        W = tl.load(W_ptrs, mask=mask, other=1.0)
+        b = tl.load(b_ptrs, mask=mask, other=0.0)
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        y = (x - mean) * rstd
+        y = y * W + b
+
+        y_ptrs = y_start_ptr + col_ids
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def layer_norm_fwd(x: Tensor, W: Tensor, b: Tensor, eps=1e-5):
+    assert x.dim() == 2, "Input must be a 2D tensor"
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    assert x.dtype in [
+        torch.float16,
+        torch.float32,
+    ], "Input must be of type float16 or float32"
+    assert W.dim() == 1 and W.shape[0] == x.shape[1], "W must be a 1D tensor with shape (N,)"
+    assert b.dim() == 1 and b.shape[0] == x.shape[1], "b must be a 1D tensor with shape (N,)"
+    assert W.is_cuda and b.is_cuda, "W and b must be CUDA tensors"
+    assert W.dtype == x.dtype and b.dtype == x.dtype, "W and b must have the same dtype as x"
+
+    num_rows, num_cols = x.shape
+    y = torch.empty_like(x)
+    mean = torch.empty((num_rows,), device=x.device, dtype=torch.float32)
+    rstd = torch.empty((num_rows,), device=x.device, dtype=torch.float32)
+    block_size = triton.next_power_of_2(num_cols)
+    # print(f"Using block size: {block_size}")
+
+    layer_norm_fwd_kernel[(num_rows,)](
+        x_ptr=x,
+        y_ptr=y,
+        mean_ptr=mean,
+        rstd_ptr=rstd,
+        W_ptr=W,
+        b_ptr=b,
+        row_stride=x.stride(0),
+        N=num_cols,
+        eps=eps,
+        BLOCK_SIZE=block_size,
+    )
+
+    return y, mean, rstd
+
+
+def layer_norm_demo():
+    N = 10240
+    batch_size = 1000
+    x = torch.rand((batch_size, N), device="cuda", dtype=torch.float32) - 0.5
+    W = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
+    b = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
+
+    y1 = torch.layer_norm(x, (N,), weight=W, bias=b, eps=1e-5)
+    y2, mean2, rstd2 = layer_norm_fwd(x, W, b, eps=1e-5)
+
+    assert torch.allclose(y1, y2, atol=1e-6), f"Results do not match: {y1} vs {y2}"
+    # assert torch.allclose(mean1, mean2, atol=1e-6), f"Results do not match: {mean1} vs {mean2}"
+    # assert torch.allclose(rstd1, rstd2, atol=1e-6), f"Results do not match: {rstd1} vs {rstd2}"
+
+    benchmark(
+        "PyTorch LayerNorm",
+        lambda: torch.layer_norm(x, (N,), weight=W, bias=b, eps=1e-5),
+        num_warmups=5,
+        num_trials=20,
+    )
+    benchmark(
+        "Triton LayerNorm",
+        lambda: layer_norm_fwd(x, W, b, eps=1e-5),
+        num_warmups=5,
+        num_trials=20,
+    )
+
 
 if __name__ == "__main__":
     # softmax_demo()
     # vec_add_demo()
     # benchmark_demo.run(show_plots=False, print_data=True)
-    matmul_demo()
+    layer_norm_demo()
