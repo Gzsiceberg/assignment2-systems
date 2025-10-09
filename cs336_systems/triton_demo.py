@@ -1,3 +1,4 @@
+from typing import Tuple
 import triton
 import triton.language as tl
 import torch
@@ -186,58 +187,115 @@ def benchmark_demo(size, provider):
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
+
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5,
-                      num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5,
-                      num_warps=2),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=5,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=5,
+            num_warps=2,
+        ),
         # Good config for fp8 inputs.
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
-                      num_warps=4)
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
     ]
 
 
 def get_autotune_config():
     return get_cuda_autotune_config()
 
+
 @triton.jit
 def matmul_kernel(
-    A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    a_row_stride, a_col_stride,
-    b_row_stride, b_col_stride,
-    c_row_stride, c_col_stride,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    a_row_stride,
+    a_col_stride,
+    b_row_stride,
+    b_col_stride,
+    c_row_stride,
+    c_col_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -245,34 +303,66 @@ def matmul_kernel(
     m_pid = tl.program_id(0)
     n_pid = tl.program_id(1)
 
-    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
-                           a_row_stride, a_col_stride, 
-                           b_row_stride, b_col_stride, 
-                           c_row_stride, c_col_stride, 
-                           BLOCK_M, BLOCK_N, BLOCK_K, 
-                           m_pid, n_pid)
+    matmul_kernel_internal(
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        M,
+        N,
+        K,
+        a_row_stride,
+        a_col_stride,
+        b_row_stride,
+        b_col_stride,
+        c_row_stride,
+        c_col_stride,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        m_pid,
+        n_pid,
+    )
+
 
 @triton.jit
-def matmul_kernel_internal(A_ptr, B_ptr, C_ptr, 
-                           M, N, K, 
-                           a_row_stride, a_col_stride, 
-                           b_row_stride, b_col_stride, 
-                           c_row_stride, c_col_stride, 
-                           BLOCK_M: tl.constexpr,
-                           BLOCK_N: tl.constexpr,
-                           BLOCK_K: tl.constexpr,
-                           m_pid, n_pid):
+def matmul_kernel_internal(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    a_row_stride,
+    a_col_stride,
+    b_row_stride,
+    b_col_stride,
+    c_row_stride,
+    c_col_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    m_pid,
+    n_pid,
+):
     c_mat = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     block_m_offsets = tl.arange(0, BLOCK_M)
     block_n_offsets = tl.arange(0, BLOCK_N)
     block_k_offsets = tl.arange(0, BLOCK_K)
     a_row_ids = (m_pid * BLOCK_M + block_m_offsets) % M
     b_row_ids = (n_pid * BLOCK_N + block_n_offsets) % N
-    a_ptrs = A_ptr + a_row_ids[:, None] * a_row_stride + block_k_offsets[None, :] * a_col_stride
-    b_ptrs = B_ptr + b_row_ids[:, None] * b_row_stride + block_k_offsets[None, :] * b_col_stride
+    a_ptrs = (
+        A_ptr
+        + a_row_ids[:, None] * a_row_stride
+        + block_k_offsets[None, :] * a_col_stride
+    )
+    b_ptrs = (
+        B_ptr
+        + b_row_ids[:, None] * b_row_stride
+        + block_k_offsets[None, :] * b_col_stride
+    )
     for k in range(0, K, BLOCK_K):
         col_ids = k + block_k_offsets
-        col_mask = (col_ids[None, :] < K)
+        col_mask = col_ids[None, :] < K
 
         a_mat = tl.load(a_ptrs, mask=col_mask, other=0.0)
         b_mat = tl.load(b_ptrs, mask=col_mask, other=0.0)
@@ -291,14 +381,20 @@ def matmul_kernel_internal(A_ptr, B_ptr, C_ptr,
     tl.store(c_ptrs, c_mat, mask=c_mask)
 
 
-
 @triton.jit
 def matmul_kernel_l2_cache(
-    A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    a_row_stride, a_col_stride,
-    b_row_stride, b_col_stride,
-    c_row_stride, c_col_stride,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    a_row_stride,
+    a_col_stride,
+    b_row_stride,
+    b_col_stride,
+    c_row_stride,
+    c_col_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -309,25 +405,45 @@ def matmul_kernel_l2_cache(
     group_row_pid = tl.program_id(2)
     m_pid = group_pid * GROUP_M + group_row_pid
 
-    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
-                        a_row_stride, a_col_stride, 
-                        b_row_stride, b_col_stride, 
-                        c_row_stride, c_col_stride, 
-                        BLOCK_M, BLOCK_N, BLOCK_K, 
-                        m_pid, n_pid)
+    matmul_kernel_internal(
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        M,
+        N,
+        K,
+        a_row_stride,
+        a_col_stride,
+        b_row_stride,
+        b_col_stride,
+        c_row_stride,
+        c_col_stride,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        m_pid,
+        n_pid,
+    )
 
 
 @triton.autotune(
     configs=get_autotune_config(),
-    key=['M', 'N', 'K'],
+    key=["M", "N", "K"],
 )
 @triton.jit
 def matmul_kernel_l2_cache_v2(
-    A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    a_row_stride, a_col_stride,
-    b_row_stride, b_col_stride,
-    c_row_stride, c_col_stride,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    a_row_stride,
+    a_col_stride,
+    b_row_stride,
+    b_col_stride,
+    c_row_stride,
+    c_col_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -354,12 +470,25 @@ def matmul_kernel_l2_cache_v2(
     # Col-id of the program in the *launch grid*
     n_pid = (in_group_id) // group_size_m
 
-    matmul_kernel_internal(A_ptr, B_ptr, C_ptr, M, N, K, 
-                        a_row_stride, a_col_stride, 
-                        b_row_stride, b_col_stride, 
-                        c_row_stride, c_col_stride, 
-                        BLOCK_M, BLOCK_N, BLOCK_K, 
-                        m_pid, n_pid)
+    matmul_kernel_internal(
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        M,
+        N,
+        K,
+        a_row_stride,
+        a_col_stride,
+        b_row_stride,
+        b_col_stride,
+        c_row_stride,
+        c_col_stride,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        m_pid,
+        n_pid,
+    )
 
 
 def triton_matmul(A: Tensor, B: Tensor) -> Tensor:
@@ -376,14 +505,24 @@ def triton_matmul(A: Tensor, B: Tensor) -> Tensor:
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     matmul_kernel[grid](
-        A_ptr=A, B_ptr=B, C_ptr=C,
-        M=M, N=N, K=K,
-        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
-        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
-        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        A_ptr=A,
+        B_ptr=B,
+        C_ptr=C,
+        M=M,
+        N=N,
+        K=K,
+        a_row_stride=A.stride(0),
+        a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0),
+        b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0),
+        c_col_stride=C.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
     return C
+
 
 def triton_matmul_l2_cache(A: Tensor, B: Tensor) -> Tensor:
     C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
@@ -403,15 +542,25 @@ def triton_matmul_l2_cache(A: Tensor, B: Tensor) -> Tensor:
     grid = (group_num, col_blocks, GROUP_M)
 
     matmul_kernel_l2_cache[grid](
-        A_ptr=A, B_ptr=B, C_ptr=C,
-        M=M, N=N, K=K,
-        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
-        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
-        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        A_ptr=A,
+        B_ptr=B,
+        C_ptr=C,
+        M=M,
+        N=N,
+        K=K,
+        a_row_stride=A.stride(0),
+        a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0),
+        b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0),
+        c_col_stride=C.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
         GROUP_M=GROUP_M,
     )
     return C
+
 
 def triton_matmul_l2_cache_v2(A: Tensor, B: Tensor) -> Tensor:
     C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
@@ -420,14 +569,23 @@ def triton_matmul_l2_cache_v2(A: Tensor, B: Tensor) -> Tensor:
     K = A.shape[1]
     assert A.shape[1] == B.shape[1], "Incompatible matrix shapes"
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
 
     matmul_kernel_l2_cache_v2[grid](
-        A_ptr=A, B_ptr=B, C_ptr=C,
-        M=M, N=N, K=K,
-        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
-        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
-        c_row_stride=C.stride(0), c_col_stride=C.stride(1)
+        A_ptr=A,
+        B_ptr=B,
+        C_ptr=C,
+        M=M,
+        N=N,
+        K=K,
+        a_row_stride=A.stride(0),
+        a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0),
+        b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0),
+        c_col_stride=C.stride(1),
     )
     return C
 
@@ -444,7 +602,6 @@ def matmul_demo():
     assert torch.allclose(
         C1, C2, rtol=0, atol=1e-2 * np.sqrt(K / 512)
     ), f"Results do not match, {C1} vs {C2}"
-
 
     benchmark(
         "PyTorch MatMul",
@@ -482,13 +639,20 @@ def matmul_demo():
     print("Compiled kernel attributes:")
     for attr in attrs:
         print(f" - {attr}")
-    
+
 
 @triton.jit
 def layer_norm_fwd_kernel(
-    x_ptr, y_ptr, mean_ptr, rstd_ptr,
-    W_ptr, b_ptr,
-    row_stride, N, eps, BLOCK_SIZE: tl.constexpr
+    x_ptr,
+    y_ptr,
+    mean_ptr,
+    rstd_ptr,
+    W_ptr,
+    b_ptr,
+    row_stride,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     x_start_ptr = x_ptr + pid * row_stride
@@ -502,7 +666,7 @@ def layer_norm_fwd_kernel(
         x_ptrs = x_start_ptr + col_ids
         x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
         mean += tl.sum(x, axis=0) / N
-    
+
     # compute variance
     var = 0.0
     for k in range(0, N, BLOCK_SIZE):
@@ -512,8 +676,8 @@ def layer_norm_fwd_kernel(
         x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
         x_minus_mean = tl.where(mask, x - mean, 0.0)
         var += tl.sum(x_minus_mean * x_minus_mean, axis=0) / N
-    
-    mean_ptr = mean_ptr + pid 
+
+    mean_ptr = mean_ptr + pid
     tl.store(mean_ptr, mean)
     rstd_ptr = rstd_ptr + pid
     rstd = 1 / tl.sqrt(var + eps)
@@ -544,10 +708,16 @@ def layer_norm_fwd(x: Tensor, W: Tensor, b: Tensor, eps=1e-5):
         torch.float16,
         torch.float32,
     ], "Input must be of type float16 or float32"
-    assert W.dim() == 1 and W.shape[0] == x.shape[1], "W must be a 1D tensor with shape (N,)"
-    assert b.dim() == 1 and b.shape[0] == x.shape[1], "b must be a 1D tensor with shape (N,)"
+    assert (
+        W.dim() == 1 and W.shape[0] == x.shape[1]
+    ), "W must be a 1D tensor with shape (N,)"
+    assert (
+        b.dim() == 1 and b.shape[0] == x.shape[1]
+    ), "b must be a 1D tensor with shape (N,)"
     assert W.is_cuda and b.is_cuda, "W and b must be CUDA tensors"
-    assert W.dtype == x.dtype and b.dtype == x.dtype, "W and b must have the same dtype as x"
+    assert (
+        W.dtype == x.dtype and b.dtype == x.dtype
+    ), "W and b must have the same dtype as x"
 
     num_rows, num_cols = x.shape
     y = torch.empty_like(x)
@@ -572,7 +742,7 @@ def layer_norm_fwd(x: Tensor, W: Tensor, b: Tensor, eps=1e-5):
     return y, mean, rstd
 
 
-def layer_norm_demo():
+def layer_norm_fw_demo():
     N = 10240
     batch_size = 1000
     x = torch.rand((batch_size, N), device="cuda", dtype=torch.float32) - 0.5
@@ -600,8 +770,129 @@ def layer_norm_demo():
     )
 
 
+@triton.jit
+def layer_norm_bwd_kernel(
+    dy_ptr, x_ptr, mean_ptr, rstd_ptr,
+    W_ptr, dx_ptr,
+    dW_ptr, db_ptr,
+    row_stride, N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mean_ptrs = mean_ptr + row
+    rstd_ptrs = rstd_ptr + row
+    mean = tl.load(mean_ptrs).to(tl.float32)
+    rstd = tl.load(rstd_ptrs).to(tl.float32)
+
+    # compute dx
+    for k in range(0, N, BLOCK_SIZE):
+        col_ids = k + col_offsets
+        mask = col_ids < N 
+
+        dy_ptrs = dy_ptr + row * row_stride + col_ids
+        x_ptrs = x_ptr + row * row_stride + col_ids
+        w_ptrs = W_ptr + col_ids
+        dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x_hat = (x - mean) * rstd
+
+        dx_c1_part = (1.0 / N) * tl.sum(x_hat * dy * w) * x_hat
+        dx_c2_part = (1.0 / N) * tl.sum(dy * w, axis=0)
+        dx_part = rstd * (dy * w - dx_c1_part - dx_c2_part)
+        dx_ptrs = dx_ptr + row * row_stride + col_ids
+        tl.store(dx_ptrs, dx_part, mask=mask)
+
+        db_part = dy
+        tl.atomic_add(db_ptr + col_ids, db_part, mask=mask)
+        dW_part = dy * x_hat
+        tl.atomic_add(dW_ptr + col_ids, dW_part, mask=mask)
+
+
+def layer_norm_bwd(dy: Tensor, x: Tensor, mean: Tensor, rstd: Tensor, W: Tensor, b: Tensor, eps=1e-5) -> Tuple[Tensor, Tensor, Tensor]:
+    num_rows, num_cols = x.shape
+    dx = torch.empty_like(x)
+    dW = torch.zeros_like(W)
+    db = torch.zeros_like(b)
+    block_size = 1024
+
+    layer_norm_bwd_kernel[(num_rows,)](
+        dy_ptr=dy,
+        x_ptr=x,
+        mean_ptr=mean,
+        rstd_ptr=rstd,
+        W_ptr=W,
+        dx_ptr=dx,
+        dW_ptr=dW,
+        db_ptr=db,
+        row_stride=x.stride(0),
+        N=num_cols,
+        BLOCK_SIZE=block_size,
+    )
+
+    return dx, dW, db
+
+
+def layer_norm_bwd_demo():
+    N = 10240 * 4
+    batch_size = 100
+    x = torch.rand((batch_size, N), device="cuda", dtype=torch.float32) - 0.5
+    W = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
+    b = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
+
+    x.requires_grad = True
+    W.requires_grad = True
+    b.requires_grad = True
+
+    y = torch.layer_norm(x, (N,), weight=W, bias=b, eps=1e-5)
+    dy = torch.rand_like(y) - 0.5
+
+    y.backward(dy, retain_graph=True)
+    dx1 = Tensor(x.grad)
+    dW1 = Tensor(W.grad)
+    db1 = Tensor(b.grad)
+
+    x.grad = None
+    W.grad = None
+    b.grad = None
+
+
+    y2, mean, rstd = layer_norm_fwd(x, W, b, eps=1e-5)
+    assert torch.allclose(y, y2, atol=1e-6), f"Results do not match: {y} vs {y2}"
+
+    dx2, dW2, db2 = layer_norm_bwd(dy, x, mean, rstd, W, b, eps=1e-5)
+
+    scale = np.sqrt(batch_size / 10)
+    assert torch.allclose(dx1, dx2, atol=1e-2 * scale, rtol=0), f"dx Results do not match: {dx1} vs {dx2}"
+    assert torch.allclose(dW1, dW2, atol=1e-2 * scale, rtol=0), f"dw Results do not match: {dW1} vs {dW2}"
+    assert torch.allclose(db1, db2, atol=1e-2 * scale, rtol=0), f"db Results do not match: {db1} vs {db2}"
+
+    def backward():
+        y.backward(dy, retain_graph=True)
+        x.grad = None
+        W.grad = None
+        b.grad = None
+
+    benchmark(
+        "PyTorch LayerNorm Backward",
+        backward,
+        num_warmups=5,
+        num_trials=20,
+    )
+
+    benchmark(
+        "Triton LayerNorm Backward",
+        lambda: layer_norm_bwd(dy, x, mean, rstd, W, b, eps=1e-5),
+        num_warmups=5,
+        num_trials=20,
+    )
+
+
+
 if __name__ == "__main__":
     # softmax_demo()
     # vec_add_demo()
     # benchmark_demo.run(show_plots=False, print_data=True)
-    layer_norm_demo()
+    # layer_norm_fw_demo()
+    layer_norm_bwd_demo()
