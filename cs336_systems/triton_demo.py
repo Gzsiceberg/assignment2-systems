@@ -56,14 +56,20 @@ def triton_softmax(x: Tensor) -> Tensor:
     return y
 
 
+@torch.compile()
+def compiled_softmax(x: Tensor) -> Tensor:
+    return softmax(x, dim=-1)
+
 def softmax_demo():
     x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).cuda()
     y1 = softmax(x, dim=-1)
     y2 = torch.softmax(x, dim=-1)
     y3 = triton_softmax(x)
+    y4 = compiled_softmax(x)
 
     assert torch.allclose(y1, y2, atol=1e-6), f"Results do not match: {y1} vs {y2}"
     assert torch.allclose(y1, y3, atol=1e-6), f"Results do not match: {y1} vs {y3}"
+    assert torch.allclose(y1, y4, atol=1e-6), f"Results do not match: {y1} vs {y4}"
 
     dim = 10240
     x = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
@@ -75,13 +81,19 @@ def softmax_demo():
     )
     benchmark("My Softmax", lambda: softmax(x, dim=-1), num_warmups=5, num_trials=20)
     benchmark("Triton Softmax", lambda: triton_softmax(x), num_warmups=5, num_trials=20)
-    table = profile("Triton Softmax Profile", lambda: triton_softmax(x))
-    print(table)
-    
-    table = profile(
-        "PyTorch Softmax Profile", lambda: torch.softmax(x, dim=-1)
+    benchmark(
+        "Compiled Softmax",
+        lambda: compiled_softmax(x),
+        num_warmups=5,
+        num_trials=20,
     )
-    print(table)
+    # table = profile("Triton Softmax Profile", lambda: triton_softmax(x))
+    # print(table)
+    
+    # table = profile(
+    #     "PyTorch Softmax Profile", lambda: torch.softmax(x, dim=-1)
+    # )
+    # print(table)
 
 
 if __name__ == "__main__":
