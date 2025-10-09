@@ -186,6 +186,51 @@ def benchmark_demo(size, provider):
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
+def is_cuda():
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def get_cuda_autotune_config():
+    return [
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5,
+                      num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5,
+                      num_warps=2),
+        # Good config for fp8 inputs.
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4,
+                      num_warps=4)
+    ]
+
+
+def get_autotune_config():
+    return get_cuda_autotune_config()
+
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
@@ -272,6 +317,10 @@ def matmul_kernel_l2_cache(
                         m_pid, n_pid)
 
 
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def matmul_kernel_l2_cache_v2(
     A_ptr, B_ptr, C_ptr,
@@ -366,26 +415,19 @@ def triton_matmul_l2_cache(A: Tensor, B: Tensor) -> Tensor:
 
 def triton_matmul_l2_cache_v2(A: Tensor, B: Tensor) -> Tensor:
     C = torch.empty((A.shape[0], B.shape[0]), device=A.device, dtype=A.dtype)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 32
-    GROUP_M = 4
-
     M = A.shape[0]
     N = B.shape[0]
     K = A.shape[1]
     assert A.shape[1] == B.shape[1], "Incompatible matrix shapes"
 
-    grid = (triton.cdiv(N, BLOCK_N) * triton.cdiv(M, BLOCK_M),)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
 
     matmul_kernel_l2_cache_v2[grid](
         A_ptr=A, B_ptr=B, C_ptr=C,
         M=M, N=N, K=K,
         a_row_stride=A.stride(0), a_col_stride=A.stride(1),
         b_row_stride=B.stride(0), b_col_stride=B.stride(1),
-        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        GROUP_M=GROUP_M,
+        c_row_stride=C.stride(0), c_col_stride=C.stride(1)
     )
     return C
 
@@ -397,11 +439,12 @@ def matmul_demo():
     B = torch.rand((N, K), device="cuda", dtype=torch.float32) - 0.5
 
     C1 = A @ B.T
-    C2 = triton_matmul(A, B)
+    C2 = triton_matmul_l2_cache(A, B)
 
     assert torch.allclose(
         C1, C2, rtol=0, atol=1e-2 * np.sqrt(K / 512)
     ), f"Results do not match, {C1} vs {C2}"
+
 
     benchmark(
         "PyTorch MatMul",
@@ -427,12 +470,18 @@ def matmul_demo():
         num_warmups=5,
         num_trials=20,
     )
-
     # ms01 = triton.testing.do_bench(lambda: torch.matmul(A, B.T), quantiles=[0.5])
     # print(f"PyTorch MatMul (triton.testing): {ms01:.2f}ms")
     # ms02 = triton.testing.do_bench(lambda: triton_matmul(A, B), quantiles=[0.5])
     # print(f"Triton MatMul (triton.testing): {ms02:.2f}ms")
 
+    compiled_kernel = list(matmul_kernel_l2_cache.cache[0].values())[0]
+    # print all attributes of compiled_kernel that do not start with _
+    attrs = [attr for attr in dir(compiled_kernel) if not attr.startswith("_")]
+    print(compiled_kernel.metadata)
+    print("Compiled kernel attributes:")
+    for attr in attrs:
+        print(f" - {attr}")
 
 if __name__ == "__main__":
     # softmax_demo()
