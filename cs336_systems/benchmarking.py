@@ -44,6 +44,7 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
     warmup_runs = args.warmup
     num_trials = args.trials
     has_autocast = args.autocast
+    profile_memory = args.memory
     has_opt = args.opt
     has_back = args.back
     vocab_size: int = 100_00
@@ -60,7 +61,8 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
         rope_theta=rope_theta,
     )
 
-    opt = AdamW(llm.parameters(), lr=1e-6)
+    if has_opt:
+        opt = AdamW(llm.parameters(), lr=1e-6)
 
     input_ids = torch.randint(0, vocab_size, (batch_size, context_length)).cuda()
     targets = torch.randint(0, vocab_size, (batch_size, context_length)).cuda()
@@ -81,6 +83,9 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
             opt.zero_grad()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+    
+    if profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -122,6 +127,12 @@ def benchmark_llm(description: str, all_result: dict, num_layers: int = 12, d_mo
             llm.zero_grad()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()  
+    
+    if profile_memory:
+        # dump memory profile
+        torch.cuda.memory._dump_snapshot(f"{description}_memory_snapshot_{profile_memory}.pickle")
+        # stop recording
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     all_result["type"].append(description)
     mean, std = np.mean(forward_times) * 1000, np.std(forward_times) * 1000
@@ -156,6 +167,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-length", type=int, default=128, help="Context length")
     parser.add_argument("-o", "--output", type=str, default="benchmark_results.md", help="Output markdown file")
     parser.add_argument("--autocast", action="store_true", help="Use autocast for mixed precision")
+    parser.add_argument("-m", "--memory", type=int, default=0, help="Measure memory usage")
     args = parser.parse_args()
 
     cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
