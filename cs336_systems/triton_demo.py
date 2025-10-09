@@ -284,18 +284,11 @@ def get_autotune_config():
 
 @triton.jit
 def matmul_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    M,
-    N,
-    K,
-    a_row_stride,
-    a_col_stride,
-    b_row_stride,
-    b_col_stride,
-    c_row_stride,
-    c_col_stride,
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    a_row_stride, a_col_stride,
+    b_row_stride, b_col_stride,
+    c_row_stride, c_col_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
