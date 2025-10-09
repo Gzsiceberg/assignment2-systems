@@ -43,18 +43,19 @@ def profile(description: str, run: Callable, num_warmups: int = 1, with_stack: b
 
 def benchmark(description: str, run: Callable, num_warmups: int = 1, num_trials: int = 3) -> tuple[float, float]:
     """Benchmark `func` by running it `num_trials`, and return all the times."""
+    is_cuda_available = torch.cuda.is_available()
     # Warmup: first times might be slower due to compilation, things not cached.
     # Since we will run the kernel multiple times, the timing that matters is steady state.
     for _ in range(num_warmups):
         run()
-        if torch.cuda.is_available():
+        if is_cuda_available:
             torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
     # Time it for real now!
     all_time: list[float] = []
     for _ in range(num_trials):
         start = timer()
         run()
-        if torch.cuda.is_available():
+        if is_cuda_available:
             torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
         end = timer()
         all_time.append(end - start)

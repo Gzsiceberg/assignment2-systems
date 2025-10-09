@@ -5,6 +5,7 @@ from torch import Tensor
 from cs336_basics.nn_utils import softmax
 from benchmarking import benchmark, profile
 from rich import print
+import numpy as np
 
 
 @triton.jit
@@ -188,18 +189,11 @@ def benchmark_demo(size, provider):
 
 @triton.jit
 def matmul_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    M,
-    N,
-    K,
-    a_row_stride,
-    a_col_stride,
-    b_row_stride,
-    b_col_stride,
-    c_row_stride,
-    c_col_stride,
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    a_row_stride, a_col_stride,
+    b_row_stride, b_col_stride,
+    c_row_stride, c_col_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -211,28 +205,20 @@ def matmul_kernel(
     block_m_offsets = tl.arange(0, BLOCK_M)
     block_n_offsets = tl.arange(0, BLOCK_N)
     block_k_offsets = tl.arange(0, BLOCK_K)
+    a_row_ids = (m_pid * BLOCK_M + block_m_offsets) % M
+    b_row_ids = (n_pid * BLOCK_N + block_n_offsets) % N
+    a_ptrs = A_ptr + a_row_ids[:, None] * a_row_stride + block_k_offsets[None, :] * a_col_stride
+    b_ptrs = B_ptr + b_row_ids[:, None] * b_row_stride + block_k_offsets[None, :] * b_col_stride
     for k in range(0, K, BLOCK_K):
-        a_row_ids = m_pid * BLOCK_M + block_m_offsets
-        a_col_ids = k + block_k_offsets
-        a_row_offsets = a_row_ids * a_row_stride
-        a_col_offsets = a_col_ids * a_col_stride
-        offset = a_row_offsets[:, None] + a_col_offsets[None, :]
-        a_mask = (a_row_ids[:, None] < M) & (a_col_ids[None, :] < K)
-        a_ptrs = A_ptr + offset
-        # assert a_ptrs.shape == (BLOCK_M, BLOCK_K)
-        a_mat = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        col_ids = k + block_k_offsets
+        col_mask = (col_ids[None, :] < K)
 
-        b_row_ids = n_pid * BLOCK_N + block_n_offsets
-        b_col_ids = k + block_k_offsets
-        b_row_offsets = b_row_ids * b_row_stride
-        b_col_offsets = b_col_ids * b_col_stride
-        offset = b_row_offsets[:, None] + b_col_offsets[None, :]
-        b_mask = (b_row_ids[:, None] < N) & (b_col_ids[None, :] < K)
-        b_ptrs = B_ptr + offset
-        # assert b_ptrs.shape == (BLOCK_N, BLOCK_K)
+        a_mat = tl.load(a_ptrs, mask=col_mask, other=0.0)
+        b_mat = tl.load(b_ptrs, mask=col_mask, other=0.0)
 
-        b_mat = tl.load(b_ptrs, mask=b_mask, other=0.0)
         c_mat += tl.dot(a_mat, tl.trans(b_mat))
+        a_ptrs += BLOCK_K * a_col_stride
+        b_ptrs += BLOCK_K * b_col_stride
 
     c_row_ids = m_pid * BLOCK_M + block_m_offsets
     c_col_ids = n_pid * BLOCK_N + block_n_offsets
@@ -241,7 +227,6 @@ def matmul_kernel(
     offset = c_row_offsets[:, None] + c_col_offsets[None, :]
     c_mask = (c_row_ids[:, None] < M) & (c_col_ids[None, :] < N)
     c_ptrs = C_ptr + offset
-    # assert c_ptrs.shape == (BLOCK_M, BLOCK_N)
     tl.store(c_ptrs, c_mat, mask=c_mask)
 
 
@@ -259,37 +244,28 @@ def triton_matmul(A: Tensor, B: Tensor) -> Tensor:
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     matmul_kernel[grid](
-        A_ptr=A,
-        B_ptr=B,
-        C_ptr=C,
-        M=M,
-        N=N,
-        K=K,
-        a_row_stride=A.stride(0),
-        a_col_stride=A.stride(1),
-        b_row_stride=B.stride(0),
-        b_col_stride=B.stride(1),
-        c_row_stride=C.stride(0),
-        c_col_stride=C.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        A_ptr=A, B_ptr=B, C_ptr=C,
+        M=M, N=N, K=K,
+        a_row_stride=A.stride(0), a_col_stride=A.stride(1),
+        b_row_stride=B.stride(0), b_col_stride=B.stride(1),
+        c_row_stride=C.stride(0), c_col_stride=C.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
     return C
 
 
 def matmul_demo():
-    M, K, N = 1024 * 4, 1024, 1024 * 4
-    A = torch.randn((M, K), device="cuda", dtype=torch.float32)
-    B = torch.randn((N, K), device="cuda", dtype=torch.float32)
+    dim = 512 * 5
+    M, K, N = dim, dim, dim
+    A = torch.rand((M, K), device="cuda", dtype=torch.float32) - 0.5
+    B = torch.rand((N, K), device="cuda", dtype=torch.float32) - 0.5
 
     C1 = A @ B.T
     C2 = triton_matmul(A, B)
 
-    # better Verify the results are close
-    # assert torch.allclose(
-    #     C1, C2, rtol=1e-2, atol=1e-2
-    # ), f"Results do not match, {C1} vs {C2}"
+    assert torch.allclose(
+        C1, C2, rtol=0, atol=1e-2 * np.sqrt(K / 512)
+    ), f"Results do not match, {C1} vs {C2}"
 
     benchmark(
         "PyTorch MatMul",
