@@ -79,6 +79,7 @@ class WeightSumTriton(torch.autograd.Function):
         N = x.shape[-1]
         M = x.numel() // N
         out = torch.empty((M,), device=x.device, dtype=torch.float32)
+        assert out.dim() == 1, f"out should be 1D with shape ({M},), but got {out.shape}"
 
         assert (
             weight.dim() == 1 and weight.shape[0] == N
@@ -112,12 +113,12 @@ class WeightSumTriton(torch.autograd.Function):
 if __name__ == "__main__":
     N = 1024
     M = 4096
-    x = torch.rand((M, N), device="cuda", dtype=torch.float32) - 0.5
+    x = torch.rand((M // 512, 512, N), device="cuda", dtype=torch.float32) - 0.5
     weight = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
 
     out1 = weighted_sum(x, weight)
     out2 = WeightSumTriton.apply(x, weight)
     max_diff = torch.max(torch.abs(out1 - out2))
-    print(f"Max diff: {max_diff:.5f}")
+    print(f"Max diff: {max_diff:.5f} out1.shape: {out1.shape}, out2.shape: {out2.shape}")
     assert torch.allclose(out1, out2, atol=1e-5, rtol=0), f"Results are not close! out1: {out1}, out2: {out2}"
 
