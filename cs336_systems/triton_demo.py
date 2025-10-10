@@ -768,8 +768,10 @@ def layer_norm_bwd_kernel(
     dy_ptr, x_ptr, mean_ptr, rstd_ptr,
     W_ptr, dx_ptr,
     dW_ptr, db_ptr,
+    lock_ptr,
     row_stride, N,
     BLOCK_SIZE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     row = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -777,38 +779,54 @@ def layer_norm_bwd_kernel(
     rstd_ptrs = rstd_ptr + row
     mean = tl.load(mean_ptrs).to(tl.float32)
     rstd = tl.load(rstd_ptrs).to(tl.float32)
+    group_id = row % GROUP_SIZE_M
+    count_ptr = lock_ptr + GROUP_SIZE_M
 
-    # compute dx
-    for k in range(0, N, BLOCK_SIZE):
-        col_ids = k + col_offsets
-        mask = col_ids < N 
+    dy_ptrs = dy_ptr + row * row_stride + col_offsets
+    dx_ptrs = dx_ptr + row * row_stride + col_offsets
+    x_ptrs = x_ptr + row * row_stride + col_offsets
+    w_ptrs = W_ptr + col_offsets
+    mask = col_offsets < N 
 
-        dy_ptrs = dy_ptr + row * row_stride + col_ids
-        x_ptrs = x_ptr + row * row_stride + col_ids
-        w_ptrs = W_ptr + col_ids
-        dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-        x_hat = (x - mean) * rstd
+    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        dx_c1_part = (1.0 / N) * tl.sum(x_hat * dy * w) * x_hat
-        dx_c2_part = (1.0 / N) * tl.sum(dy * w, axis=0)
-        dx_part = rstd * (dy * w - dx_c1_part - dx_c2_part)
-        dx_ptrs = dx_ptr + row * row_stride + col_ids
-        tl.store(dx_ptrs, dx_part, mask=mask)
+    x_hat = (x - mean) * rstd
+    x_hat = tl.where(mask, x_hat, 0.0)
+    wdy = w * dy
 
-        db_part = dy
-        tl.atomic_add(db_ptr + col_ids, db_part, mask=mask)
-        dW_part = dy * x_hat
-        tl.atomic_add(dW_ptr + col_ids, dW_part, mask=mask)
+    dx_c1_part = (1.0 / N) * tl.sum(x_hat * wdy) * x_hat
+    dx_c2_part = (1.0 / N) * tl.sum(wdy, axis=0)
+    dx_part = rstd * (wdy - dx_c1_part - dx_c2_part)
+    tl.store(dx_ptrs, dx_part, mask=mask)
+
+    while tl.atomic_cas(lock_ptr + group_id, 0, 1) != 0:
+        pass
+    dW_ptrs = dW_ptr + group_id * row_stride + col_offsets
+    dW_part = dy * x_hat + tl.load(dW_ptrs, mask=mask, other=0.0)
+    tl.store(dW_ptrs, dW_part, mask=mask)
+
+    db_ptrs = db_ptr + group_id * row_stride + col_offsets
+    db_part = dy + tl.load(db_ptrs, mask=mask, other=0.0)
+    tl.store(db_ptrs, db_part, mask=mask)
+
+    # need a barrier to ensure all threads finished before
+    # releasing the lock
+    tl.debug_barrier()
+
+    # Release the lock
+    tl.atomic_xchg(lock_ptr + group_id, 0)
 
 
 def layer_norm_bwd(dy: Tensor, x: Tensor, mean: Tensor, rstd: Tensor, W: Tensor, b: Tensor, eps=1e-5) -> Tuple[Tensor, Tensor, Tensor]:
     num_rows, num_cols = x.shape
     dx = torch.empty_like(x)
-    dW = torch.zeros_like(W)
-    db = torch.zeros_like(b)
-    block_size = 1024
+    block_size = triton.next_power_of_2(num_cols)
+    group_size_m = min(64, num_rows // 4)
+    lock = torch.zeros((group_size_m, 2), dtype=torch.int32, device=x.device)
+    dW = torch.zeros((group_size_m, num_cols), dtype=torch.float32, device=x.device)
+    db = torch.zeros((group_size_m, num_cols), dtype=torch.float32, device=x.device)
 
     layer_norm_bwd_kernel[(num_rows,)](
         dy_ptr=dy,
@@ -819,17 +837,19 @@ def layer_norm_bwd(dy: Tensor, x: Tensor, mean: Tensor, rstd: Tensor, W: Tensor,
         dx_ptr=dx,
         dW_ptr=dW,
         db_ptr=db,
+        lock_ptr=lock,
         row_stride=x.stride(0),
         N=num_cols,
         BLOCK_SIZE=block_size,
+        GROUP_SIZE_M=group_size_m,
     )
 
-    return dx, dW, db
+    return dx, dW.sum(dim=0), db.sum(dim=0)
 
 
 def layer_norm_bwd_demo():
-    N = 10240 * 4
-    batch_size = 100
+    N = 1024 + 512
+    batch_size = 10000
     x = torch.rand((batch_size, N), device="cuda", dtype=torch.float32) - 0.5
     W = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
     b = torch.rand((N,), device="cuda", dtype=torch.float32) - 0.5
@@ -856,10 +876,10 @@ def layer_norm_bwd_demo():
 
     dx2, dW2, db2 = layer_norm_bwd(dy, x, mean, rstd, W, b, eps=1e-5)
 
-    scale = np.sqrt(batch_size / 10)
-    assert torch.allclose(dx1, dx2, atol=1e-2 * scale, rtol=0), f"dx Results do not match: {dx1} vs {dx2}"
-    assert torch.allclose(dW1, dW2, atol=1e-2 * scale, rtol=0), f"dw Results do not match: {dW1} vs {dW2}"
-    assert torch.allclose(db1, db2, atol=1e-2 * scale, rtol=0), f"db Results do not match: {db1} vs {db2}"
+    scale = 1.0
+    assert torch.allclose(dx1, dx2, atol=1e-3 * scale, rtol=0), f"dx Results do not match: {dx1} vs {dx2}"
+    assert torch.allclose(dW1, dW2, atol=1e-3 * scale, rtol=0), f"dw Results do not match: {dW1} vs {dW2}"
+    assert torch.allclose(db1, db2, atol=1e-3 * scale, rtol=0), f"db Results do not match: {db1} vs {db2}"
 
     def backward():
         y.backward(dy, retain_graph=True)
