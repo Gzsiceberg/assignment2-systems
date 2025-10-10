@@ -818,6 +818,33 @@ def layer_norm_bwd_kernel(
     # Release the lock
     tl.atomic_xchg(lock_ptr + group_id, 0)
 
+@triton.jit
+def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
+                         DB,  # pointer to the partial sum of biases gradient
+                         FINAL_DW,  # pointer to the weights gradient
+                         FINAL_DB,  # pointer to the biases gradient
+                         M,  # GROUP_SIZE_M
+                         N,  # number of columns
+                         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    # Map the program id to the elements of DW and DB it should compute.
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Iterate through the rows of DW and DB to sum the partial sums.
+    for i in range(0, M, BLOCK_SIZE_M):
+        rows = i + tl.arange(0, BLOCK_SIZE_M)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        dw += tl.load(DW + offs, mask=mask, other=0.)
+        db += tl.load(DB + offs, mask=mask, other=0.)
+    # Write the final sum to the output.
+    sum_dw = tl.sum(dw, axis=0)
+    sum_db = tl.sum(db, axis=0)
+    tl.store(FINAL_DW + cols, sum_dw, mask=cols < N)
+    tl.store(FINAL_DB + cols, sum_db, mask=cols < N)
+
+
 
 def layer_norm_bwd(dy: Tensor, x: Tensor, mean: Tensor, rstd: Tensor, W: Tensor, b: Tensor, eps=1e-5) -> Tuple[Tensor, Tensor, Tensor]:
     num_rows, num_cols = x.shape
@@ -845,6 +872,23 @@ def layer_norm_bwd(dy: Tensor, x: Tensor, mean: Tensor, rstd: Tensor, W: Tensor,
     )
 
     return dx, dW.sum(dim=0), db.sum(dim=0)
+
+
+class LayerNormTriton(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, W, b, eps=1e-5):
+        y, mean, rstd = layer_norm_fwd(x, W, b, eps)
+        ctx.save_for_backward(x, mean, rstd, W, b)
+        ctx.eps = eps
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, mean, rstd, W, b = ctx.saved_tensors
+        eps = ctx.eps
+        dx, dW, db = layer_norm_bwd(dy, x, mean, rstd, W, b, eps)
+        return dx, dW, db, None
 
 
 def layer_norm_bwd_demo():
@@ -908,4 +952,6 @@ if __name__ == "__main__":
     # vec_add_demo()
     # benchmark_demo.run(show_plots=False, print_data=True)
     # layer_norm_fw_demo()
-    layer_norm_bwd_demo()
+    # layer_norm_bwd_demo()
+    # test_layer_norm(1024, 1024, torch.float32)
+    pass
