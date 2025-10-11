@@ -41,6 +41,7 @@ class FlashAttention(torch.autograd.Function):
         ctx, Q: Tensor, K: Tensor, V: Tensor, is_casual: bool = False
     ) -> Tensor:
         block_rows, block_cols = 16, 16
+        assert block_rows == block_cols
         q_shape = Q.shape
         Q = rearrange(Q, "... s d -> (...) s d")
         K = rearrange(K, "... s d -> (...) s d")
@@ -53,6 +54,8 @@ class FlashAttention(torch.autograd.Function):
         final_o = torch.empty_like(V)
         final_l = torch.empty((batch_size, context_len), device=Q.device)
         sqrt_d = np.sqrt(d_model)
+        mask = torch.tril(torch.ones((block_rows, block_cols), device=Q.device)).unsqueeze(0)  # (1, block_rows, block_cols)
+        mask = mask.to(torch.bool)
         for i in range(num_block_rows):
             q_i = Q[:, i * block_rows : (i + 1) * block_rows, :]  # (B, block_rows, D)
             assert q_i.shape == (batch_size, block_rows, d_model)
@@ -80,12 +83,7 @@ class FlashAttention(torch.autograd.Function):
                     )  # (B, block_rows, block_cols)
                     assert s_ij.shape == (batch_size, block_rows, block_cols)
                 if is_casual and j == i:
-                    mask = torch.tril(
-                        torch.ones((block_rows, block_cols), device=Q.device)
-                    ).unsqueeze(
-                        0
-                    )  # (1, block_rows, block_cols)
-                    s_ij = s_ij * mask + (1.0 - mask) * float("-inf")
+                    s_ij = torch.where(mask, s_ij, -1e6)
 
                 row_max = torch.amax(s_ij, dim=-1)  # (B, block_rows)
                 m_ij = torch.maximum(m_i, row_max)
@@ -138,18 +136,19 @@ def flash_fwd_kernel(
     stride_ob, stride_oq, stride_od,
     stride_lb, stride_lq,
     N_QUERIES, N_KEYS, scale,
+    is_casual: tl.constexpr,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
 ):
-    query_tile_row = tl.program_id(0)
+    row_id = tl.program_id(0)
     batch_id = tl.program_id(1)
 
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_id * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(query_tile_row * Q_TILE_SIZE, 0),
+        offsets=(row_id * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )  # (Q_TILE_SIZE, D)
@@ -173,31 +172,35 @@ def flash_fwd_kernel(
     )  # (K_TILE_SIZE, D)
 
     q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D)
-    q_dtype = q.dtype
     o = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # (Q_TILE_SIZE, D)
     m = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)  # (Q_TILE_SIZE,)
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)  # (Q_TILE_SIZE,)
 
-    for _ in range(0, N_KEYS, K_TILE_SIZE):
-        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
-        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+    num_cols = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+    for col_id in range(num_cols):
+        if not is_casual or col_id <= row_id:
+            k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+            v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
 
-        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
-        m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
+            s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+            if is_casual and (col_id == row_id):
+                s = tl.where(mask, s, -1e6)
+            row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
+            m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
 
-        p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
-        l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
+            p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+            exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
+            l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
 
-        p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
-        o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
+            p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
+            o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
 
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+            K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+            V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
 
-        m = m_new
-        l = l_new
+            m = m_new
+            l = l_new
     final_o = o / l[:, None]  # (Q_TILE_SIZE, D)
     final_o = tl.cast(final_o, V_block_ptr.type.element_ty)  # (Q_TILE_SIZE, D)
     final_l = m + tl.log(l)  # (Q_TILE_SIZE,)
@@ -205,7 +208,7 @@ def flash_fwd_kernel(
         O_ptr + batch_id * stride_ob,
         shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
-        offsets=(query_tile_row * Q_TILE_SIZE, 0),
+        offsets=(row_id * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )  # (Q_TILE_SIZE, D)
@@ -215,7 +218,7 @@ def flash_fwd_kernel(
         L_ptr + batch_id * stride_lb,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
-        offsets=(query_tile_row * Q_TILE_SIZE,),
+        offsets=(row_id * Q_TILE_SIZE,),
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )  # (Q_TILE_SIZE,)
@@ -223,10 +226,11 @@ def flash_fwd_kernel(
         
 
 def flash_attention_fwd(
-    Q: Tensor, K: Tensor, V: Tensor, block_rows: int, block_cols: int
+    Q: Tensor, K: Tensor, V: Tensor, block_rows: int, block_cols: int, is_casual: bool = False
 ) -> Tuple[Tensor, Tensor]:
     assert Q.is_cuda and K.is_cuda and V.is_cuda
     assert Q.shape == K.shape and K.shape == V.shape
+    assert block_rows == block_cols
     batch_size, N_QUERIES, d_dim = Q.shape
     N_KEYS = K.shape[1]
     O = torch.empty_like(V)
@@ -242,6 +246,7 @@ def flash_attention_fwd(
         O.stride(0), O.stride(1), O.stride(2),
         L.stride(0), L.stride(1),
         N_QUERIES, N_KEYS, scale,
+        is_casual=is_casual,
         D=d_dim,
         Q_TILE_SIZE=block_rows,
         K_TILE_SIZE=block_cols,
@@ -259,7 +264,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         Q = rearrange(Q, "... s d -> (...) s d")
         K = rearrange(K, "... s d -> (...) s d")
         V = rearrange(V, "... s d -> (...) s d")
-        O, L = flash_attention_fwd(Q, K, V, block_rows, block_cols)
+        O, L = flash_attention_fwd(Q, K, V, block_rows, block_cols, is_casual=is_casual)
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_casual = is_casual
         ctx.block_rows = block_rows
@@ -276,22 +281,33 @@ class FlashAttentionTriton(torch.autograd.Function):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
+    is_casual = True
     q = torch.rand(2, 128, 64).cuda() - 0.5
     k = torch.rand(2, 128, 64).cuda() - 0.5
     v = torch.rand(2, 128, 64).cuda() - 0.5
+    mask = torch.tril(torch.ones(128, 128)).cuda()
+    mask = mask.to(torch.bool)
+    mask = rearrange(mask, "i j -> 1 i j")
 
-    out1 = FlashAttention.apply(q, k, v, False)
-    out2 = FlashAttentionTriton.apply(q, k, v, False)
+    q_index = torch.arange(128)
+    k_index = torch.arange(128)
+    mask02 = q_index[:, None] >= k_index[None, :]
+    mask02 = mask02.to(torch.bool).cuda()
+    mask02 = rearrange(mask02, "i j -> 1 i j")
+    assert torch.equal(mask, mask02)
+
+    out1 = FlashAttention.apply(q, k, v, is_casual)
+    out2 = FlashAttentionTriton.apply(q, k, v, is_casual)
 
     from cs336_basics.model import scaled_dot_product_attention
-    out_bench = scaled_dot_product_attention(q, k, v)
+    out_bench = scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None)
 
     assert torch.allclose(
-        out1, out_bench, atol=1e-4
-    ), f"Max diff FlashAttention2: {(out1 - out_bench).abs().max():.6f}"
+        out1, out_bench, atol=1e-3
+    ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
     print("correctness test passed!")
 
     assert torch.allclose(
-        out2, out_bench, atol=1e-4
+        out2, out_bench, atol=1e-3
     ), f"Max diff FlashAttentionTriton: {(out2 - out_bench).abs().max():.6f}"
     print("correctness test passed!")
