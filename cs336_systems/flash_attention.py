@@ -283,7 +283,7 @@ class FlashAttentionTriton(torch.autograd.Function):
 if __name__ == "__main__":
     torch.manual_seed(0)
     is_casual = True
-    context_len = 1024
+    context_len = 2048
     d_model = 64
     batch_size = 64
     q = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
