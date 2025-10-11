@@ -178,31 +178,30 @@ def flash_fwd_kernel(
 
     num_cols = tl.cdiv(N_KEYS, K_TILE_SIZE)
     mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
-    for col_id in range(num_cols):
-        if is_casual and (col_id > row_id):
-            pass
-        else:
-            k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
-            v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+    if is_casual:
+        num_cols = min(num_cols, row_id + 1)
+    for col_id in tl.range(num_cols):
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
 
-            s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-            if is_casual and (col_id == row_id):
-                s = tl.where(mask, s, -1e6)
-            row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
-            m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual and (col_id == row_id):
+            s = tl.where(mask, s, -1e6)
+        row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
+        m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
 
-            p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-            exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
-            l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
+        p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
+        l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
 
-            p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
-            o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
+        p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
+        o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
 
-            K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-            V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
 
-            m = m_new
-            l = l_new
+        m = m_new
+        l = l_new
     final_o = o / l[:, None]  # (Q_TILE_SIZE, D)
     final_o = tl.cast(final_o, V_block_ptr.type.element_ty)  # (Q_TILE_SIZE, D)
     final_l = m + tl.log(l)  # (Q_TILE_SIZE,)
@@ -284,15 +283,18 @@ class FlashAttentionTriton(torch.autograd.Function):
 if __name__ == "__main__":
     torch.manual_seed(0)
     is_casual = True
-    q = torch.rand(2, 128, 64).cuda() - 0.5
-    k = torch.rand(2, 128, 64).cuda() - 0.5
-    v = torch.rand(2, 128, 64).cuda() - 0.5
-    mask = torch.tril(torch.ones(128, 128)).cuda()
+    context_len = 1024
+    d_model = 128
+    batch_size = 64
+    q = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    k = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    v = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    mask = torch.tril(torch.ones(context_len, context_len)).cuda()
     mask = mask.to(torch.bool)
     mask = rearrange(mask, "i j -> 1 i j")
 
-    q_index = torch.arange(128)
-    k_index = torch.arange(128)
+    q_index = torch.arange(context_len)
+    k_index = torch.arange(context_len)
     mask02 = q_index[:, None] >= k_index[None, :]
     mask02 = mask02.to(torch.bool).cuda()
     mask02 = rearrange(mask02, "i j -> 1 i j")
@@ -313,3 +315,10 @@ if __name__ == "__main__":
         out2, out_bench, atol=1e-3
     ), f"Max diff FlashAttentionTriton: {(out2 - out_bench).abs().max():.6f}"
     print("correctness test passed!")
+
+
+    mean_ms = triton.testing.do_bench(lambda: FlashAttentionTriton.apply(q, k, v, is_casual), quantiles=[0.5])
+    print(f"FlashAttentionTriton: {mean_ms:.2f}ms")
+
+    mean_ms = triton.testing.do_bench(lambda: scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None), quantiles=[0.5])
+    print(f"PyTorch Attention: {mean_ms:.2f}ms")
