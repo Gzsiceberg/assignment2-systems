@@ -34,13 +34,13 @@ class NaiveAttention(torch.autograd.Function):
         )
 
 
-class FlashAttention2(torch.autograd.Function):
+class FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(
         ctx, Q: Tensor, K: Tensor, V: Tensor, is_casual: bool = False
     ) -> Tensor:
-        block_rows, block_cols = 128, 128
+        block_rows, block_cols = 16, 16
         q_shape = Q.shape
         Q = rearrange(Q, "... s d -> (...) s d")
         K = rearrange(K, "... s d -> (...) s d")
@@ -142,22 +142,152 @@ def flash_fwd_kernel(
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
 ):
-    pass
+    query_tile_row = tl.program_id(0)
+    batch_id = tl.program_id(1)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_id * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_row * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D)
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_id * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D)
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_id * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D)
+
+    q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D)
+    o = tl.zeros((Q_TILE_SIZE, D), dtype=q.dtype)  # (Q_TILE_SIZE, D)
+    m = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=q.dtype)  # (Q_TILE_SIZE,)
+    l = tl.zeros((Q_TILE_SIZE,), dtype=q.dtype)  # (Q_TILE_SIZE,)
+
+    for _ in range(0, N_KEYS, K_TILE_SIZE):
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
+        m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
+
+        p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
+        l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
+        o = o * exp_m[:, None] + tl.dot(p, v)  # (Q_TILE_SIZE, D)
+
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+
+        m = m_new
+        l = l_new
+    final_o = o / l[:, None]  # (Q_TILE_SIZE, D)
+    final_l = m + tl.log(l)  # (Q_TILE_SIZE,)
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_id * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_row * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D)
+    tl.store(O_block_ptr, final_o, boundary_check=(0, 1))
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_id * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_row * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )  # (Q_TILE_SIZE,)
+    tl.store(L_block_ptr, final_l, boundary_check=(0,))
+        
+
+def flash_attention_fwd(
+    Q: Tensor, K: Tensor, V: Tensor, block_rows: int, block_cols: int
+) -> Tuple[Tensor, Tensor]:
+    assert Q.is_cuda and K.is_cuda and V.is_cuda
+    assert Q.shape == K.shape and K.shape == V.shape
+    batch_size, N_QUERIES, d_dim = Q.shape
+    N_KEYS = K.shape[1]
+    O = torch.empty_like(V)
+    L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=Q.dtype)
+    scale = 1.0 / np.sqrt(d_dim)
+    grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
+
+    flash_fwd_kernel[grid](
+        Q, K, V, O, L,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K.stride(0), K.stride(1), K.stride(2),
+        V.stride(0), V.stride(1), V.stride(2),
+        O.stride(0), O.stride(1), O.stride(2),
+        L.stride(0), L.stride(1),
+        N_QUERIES, N_KEYS, scale,
+        D=d_dim,
+        Q_TILE_SIZE=block_rows,
+        K_TILE_SIZE=block_cols,
+    )
+    return O, L
+
+class FlashAttentionTriton(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx, Q: Tensor, K: Tensor, V: Tensor, is_casual: bool = False
+    ) -> Tensor:
+        block_rows, block_cols = 16, 16
+        q_shape = Q.shape
+        Q = rearrange(Q, "... s d -> (...) s d")
+        K = rearrange(K, "... s d -> (...) s d")
+        V = rearrange(V, "... s d -> (...) s d")
+        O, L = flash_attention_fwd(Q, K, V, block_rows, block_cols)
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_casual = is_casual
+        ctx.block_rows = block_rows
+        ctx.block_cols = block_cols
+        ctx.q_shape = q_shape
+        return O.reshape(q_shape)
+
+    @staticmethod
+    def backward(ctx, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
+        raise NotImplementedError(
+            "FlashAttention backward pass is not implemented yet."
+        )
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    q = torch.rand(2, 128, 2).cuda() - 0.5
-    k = torch.rand(2, 128, 2).cuda() - 0.5
-    v = torch.rand(2, 128, 2).cuda() - 0.5
+    q = torch.rand(2, 128, 64).cuda() - 0.5
+    k = torch.rand(2, 128, 64).cuda() - 0.5
+    v = torch.rand(2, 128, 64).cuda() - 0.5
 
-    out = FlashAttention2.apply(q, k, v, False)
+    out1 = FlashAttention.apply(q, k, v, False)
+    out2 = FlashAttentionTriton.apply(q, k, v, False)
 
     from cs336_basics.model import scaled_dot_product_attention
-
-    out2 = scaled_dot_product_attention(q, k, v)
+    out_bench = scaled_dot_product_attention(q, k, v)
 
     assert torch.allclose(
-        out, out2, atol=1e-4
-    ), f"Max diff: {(out - out2).abs().max():.6f}"
+        out1, out_bench, atol=1e-4
+    ), f"Max diff FlashAttention2: {(out1 - out_bench).abs().max():.6f}"
+    print("correctness test passed!")
+
+    assert torch.allclose(
+        out2, out_bench, atol=1e-4
+    ), f"Max diff FlashAttentionTriton: {(out2 - out_bench).abs().max():.6f}"
     print("correctness test passed!")
