@@ -173,9 +173,10 @@ def flash_fwd_kernel(
     )  # (K_TILE_SIZE, D)
 
     q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D)
-    o = tl.zeros((Q_TILE_SIZE, D), dtype=q.dtype)  # (Q_TILE_SIZE, D)
-    m = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=q.dtype)  # (Q_TILE_SIZE,)
-    l = tl.zeros((Q_TILE_SIZE,), dtype=q.dtype)  # (Q_TILE_SIZE,)
+    q_dtype = q.dtype
+    o = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # (Q_TILE_SIZE, D)
+    m = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)  # (Q_TILE_SIZE,)
+    l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)  # (Q_TILE_SIZE,)
 
     for _ in range(0, N_KEYS, K_TILE_SIZE):
         k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
@@ -188,7 +189,9 @@ def flash_fwd_kernel(
         p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
         exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
         l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
-        o = o * exp_m[:, None] + tl.dot(p, v)  # (Q_TILE_SIZE, D)
+
+        p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
+        o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
 
         K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
         V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
@@ -196,6 +199,7 @@ def flash_fwd_kernel(
         m = m_new
         l = l_new
     final_o = o / l[:, None]  # (Q_TILE_SIZE, D)
+    final_o = tl.cast(final_o, V_block_ptr.type.element_ty)  # (Q_TILE_SIZE, D)
     final_l = m + tl.log(l)  # (Q_TILE_SIZE,)
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_id * stride_ob,
@@ -226,7 +230,7 @@ def flash_attention_fwd(
     batch_size, N_QUERIES, d_dim = Q.shape
     N_KEYS = K.shape[1]
     O = torch.empty_like(V)
-    L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=Q.dtype)
+    L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=torch.float32)
     scale = 1.0 / np.sqrt(d_dim)
     grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
 
