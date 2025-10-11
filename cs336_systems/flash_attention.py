@@ -179,7 +179,9 @@ def flash_fwd_kernel(
     num_cols = tl.cdiv(N_KEYS, K_TILE_SIZE)
     mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
     for col_id in range(num_cols):
-        if not is_casual or col_id <= row_id:
+        if is_casual and (col_id > row_id):
+            pass
+        else:
             k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
             v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
 
