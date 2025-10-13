@@ -184,7 +184,28 @@ class FlashAttention(torch.autograd.Function):
         dK = dS.transpose(-2, -1) @ Q / sqrt_d  # (B, S, D)
         return dQ, dK, dV
 
+def estimate_smem(Q, D, num_stages=2, dtype_bytes=2, extra=0):
+    # 举例：Q/K tile 的缓冲 + 其他缓冲，注意是否有双缓冲
+    q_buf = Q * D * dtype_bytes
+    return (q_buf + extra) * 3 * num_stages
 
+def get_autotune_config():
+    return [
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64},
+        ),
+    ]
+
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["D_MODEL", "N_QUERIES"],
+)
 @triton.jit
 def flash_bkw_vk_kernel(
     Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr,
@@ -336,6 +357,11 @@ def flash_bkw_vk_kernel(
     v_dtype = V_block_ptr.type.element_ty
     tl.store(dV_block_ptr, dV.to(v_dtype), boundary_check=(0, 1))
 
+
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["D_MODEL", "N_QUERIES"],
+)
 @triton.jit
 def flash_bkw_q_kernel(
     Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr,
@@ -455,7 +481,7 @@ def flash_bkw_q_kernel(
     tl.store(dQ_block_ptr, dQ.to(q_dtype), boundary_check=(0, 1))
 
 def flash_attention_bkw(
-    Q: Tensor, K: Tensor, V: Tensor, L: Tensor, dO: Tensor, O: Tensor, block_rows: int, block_cols: int, is_casual: bool = False
+    Q: Tensor, K: Tensor, V: Tensor, L: Tensor, dO: Tensor, O: Tensor, is_casual: bool = False
 ) -> Tuple[Tensor, Tensor, Tensor]:
     batch_size, N_QUERIES, d_dim = Q.shape
     _, N_KEYS, _ = K.shape
@@ -467,7 +493,7 @@ def flash_attention_bkw(
     dK = torch.zeros_like(K)
     dV = torch.zeros_like(V)
 
-    grid = (triton.cdiv(N_KEYS, block_cols), batch_size)
+    grid = lambda META: (triton.cdiv(N_KEYS, META["K_TILE_SIZE"]), batch_size)
     flash_bkw_vk_kernel[grid](
         Q, K, V, dO, L, D, dK, dV,
         Q.stride(0), Q.stride(1), Q.stride(2),
@@ -481,11 +507,9 @@ def flash_attention_bkw(
         scale,
         is_casual=is_casual,
         D_MODEL=d_dim,
-        Q_TILE_SIZE=block_rows,
-        K_TILE_SIZE=block_cols,
     )
 
-    grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
+    grid = lambda META: (triton.cdiv(N_QUERIES, META["Q_TILE_SIZE"]), batch_size)
     flash_bkw_q_kernel[grid](
         Q, K, V, dO, L, D, dQ,
         Q.stride(0), Q.stride(1), Q.stride(2),
@@ -499,12 +523,14 @@ def flash_attention_bkw(
         scale,
         is_casual=is_casual,
         D_MODEL=d_dim,
-        Q_TILE_SIZE=block_rows,
-        K_TILE_SIZE=block_cols,
     )
     return dQ, dK, dV
 
 
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["D_MODEL", "N_QUERIES"],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
@@ -623,18 +649,17 @@ def flash_fwd_kernel(
         
 
 def flash_attention_fwd(
-    Q: Tensor, K: Tensor, V: Tensor, block_rows: int, block_cols: int, is_casual: bool = False
+    Q: Tensor, K: Tensor, V: Tensor, is_casual: bool = False
 ) -> Tuple[Tensor, Tensor]:
     assert Q.is_cuda and K.is_cuda and V.is_cuda
     assert Q.shape == K.shape and K.shape == V.shape
-    assert block_rows == block_cols
     batch_size, N_QUERIES, d_dim = Q.shape
     N_KEYS = K.shape[1]
     O = torch.empty_like(V)
     L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=V.dtype)
     scale = 1.0 / math.sqrt(d_dim)
-    grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
 
+    grid = lambda META: (triton.cdiv(N_QUERIES, META["Q_TILE_SIZE"]), batch_size)
     flash_fwd_kernel[grid](
         Q, K, V, O, L,
         Q.stride(0), Q.stride(1), Q.stride(2),
@@ -645,8 +670,8 @@ def flash_attention_fwd(
         N_QUERIES, N_KEYS, scale,
         is_casual=is_casual,
         D=d_dim,
-        Q_TILE_SIZE=block_rows,
-        K_TILE_SIZE=block_cols,
+        # Q_TILE_SIZE=block_rows,
+        # K_TILE_SIZE=block_cols,
     )
     return O, L
 
@@ -656,21 +681,13 @@ class FlashAttentionTriton(torch.autograd.Function):
     def forward(
         ctx, Q: Tensor, K: Tensor, V: Tensor, is_casual: bool = False
     ) -> Tensor:
-        block_rows, block_cols = 16, 16
         q_shape = Q.shape
         Q = rearrange(Q, "... s d -> (...) s d")
         K = rearrange(K, "... s d -> (...) s d")
         V = rearrange(V, "... s d -> (...) s d")
-        context_len = Q.shape[1]
-        if context_len < 4096:
-            block_rows, block_cols = 16, 16
-        else:
-            block_rows, block_cols = 32, 32
-        O, L = flash_attention_fwd(Q, K, V, block_rows, block_cols, is_casual=is_casual)
+        O, L = flash_attention_fwd(Q, K, V, is_casual=is_casual)
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_casual = is_casual
-        ctx.block_rows = block_rows
-        ctx.block_cols = block_cols
         ctx.q_shape = q_shape
         return O.reshape(q_shape)
 
@@ -678,12 +695,10 @@ class FlashAttentionTriton(torch.autograd.Function):
     def backward(ctx, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
         Q, K, V, O, L = ctx.saved_tensors
         is_casual = ctx.is_casual
-        block_rows = ctx.block_rows
-        block_cols = ctx.block_cols
         q_shape = ctx.q_shape
         dO = rearrange(dO, "... s d -> (...) s d")
         # dQ, dK, dV = FlashAttention._backward(Q, K, V, L, is_casual, dO)
-        dQ, dK, dV = flash_attention_bkw(Q, K, V, L, dO, O, block_rows, block_cols, is_casual=is_casual)
+        dQ, dK, dV = flash_attention_bkw(Q, K, V, L, dO, O, is_casual=is_casual)
         return dQ.reshape(q_shape), dK.reshape(q_shape), dV.reshape(q_shape), None
     
 
@@ -907,9 +922,9 @@ def benchmark():
 
     }
     context_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    # context_lens = [8192,]
+    context_lens = [8192,]
     d_models = [16, 32, 64, 128]
-    # d_models = [64,]
+    # d_models = [128,]
     for context_len in context_lens:
         for d_model in d_models:
             print("-" * 80)
@@ -917,6 +932,8 @@ def benchmark():
             all_data["context_len"].append(context_len)
             all_data["d_model"].append(d_model)
             do_benchmark(context_len, d_model, is_casual, all_data, dtype=dtype)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
     import pandas as pd
     df = pd.DataFrame(all_data)
     df["FWD"] = df["pytorch_fw"] / df["flash_attention_fw"]
