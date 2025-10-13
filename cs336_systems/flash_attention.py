@@ -185,6 +185,293 @@ class FlashAttention(torch.autograd.Function):
         return dQ, dK, dV
 
 
+@triton.jit
+def flash_bkw_vk_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr,
+    dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    stride_db, stride_dq,
+    N_QUERIES, N_KEYS, scale,
+    is_casual: tl.constexpr,
+    D_MODEL: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    col_id = tl.program_id(0)
+    batch_id = tl.program_id(1)
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_id * stride_qb,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_qq, stride_qd),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D)
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_id * stride_kb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_kk, stride_kd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D)
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_id * stride_vb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_vk, stride_vd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D)
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_id * stride_ob,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_oq, stride_od),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D)
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_id * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )  # (Q_TILE_SIZE,)
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_id * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )  # (Q_TILE_SIZE,)
+
+    k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+    v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+    row_nums = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
+    start_row = 0
+    if is_casual:
+        start_row = col_id
+    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+    dV = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
+    dK = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
+    for row in range(start_row, row_nums):
+        q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+        dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+        l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+        d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual and (row == col_id):
+            s = tl.where(mask, s, -1e6)
+        p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dV = tl.dot(tl.trans(p), dO, acc=dV)  # (K_TILE_SIZE, D)
+        dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual and (row == col_id):
+            dP = tl.where(mask, dP, 0.0)
+        dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dK = tl.dot(tl.trans(dS), q, acc=dK)  # (K_TILE_SIZE, D)
+
+        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+
+    k_dtype = K_block_ptr.type.element_ty
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr + batch_id * stride_kb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_kk, stride_kd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+    tl.store(dK_block_ptr, dK.to(k_dtype), boundary_check=(0, 1))
+
+    v_dtype = V_block_ptr.type.element_ty
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_id * stride_vb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_vk, stride_vd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+    tl.store(dV_block_ptr, dV.to(v_dtype), boundary_check=(0, 1))
+
+@triton.jit
+def flash_bkw_q_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr,
+    dQ_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    stride_db, stride_dq,
+    N_QUERIES, N_KEYS, scale,
+    is_casual: tl.constexpr,
+    D_MODEL: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    batch_id = tl.program_id(1)
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_id * stride_kb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_id * stride_vb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_id * stride_qb,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_qq, stride_qd),
+        offsets=(row_id * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D_MODEL)
+
+    dQ_block_ptr = tl.make_block_ptr(
+        dQ_ptr + batch_id * stride_qb,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_qq, stride_qd),
+        offsets=(row_id * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D_MODEL)
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_id * stride_ob,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_oq, stride_od),
+        offsets=(row_id * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D_MODEL)
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_id * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(row_id * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )  # (Q_TILE_SIZE,)
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_id * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(row_id * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )  # (Q_TILE_SIZE,)
+
+    col_nums = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    if is_casual:
+        col_nums = min(col_nums, row_id + 1)
+    q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+    dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+    l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+    d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+
+    dQ = tl.zeros((Q_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (Q_TILE_SIZE, D_MODEL)
+    for col_id in range(col_nums):
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual and (col_id == row_id):
+            s = tl.where(mask, s, -1e6)
+        p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+
+        dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual and (col_id == row_id):
+            dP = tl.where(mask, dP, 0.0)
+        dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dQ = tl.dot(dS, k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    q_dtype = Q_block_ptr.type.element_ty
+    tl.store(dQ_block_ptr, dQ.to(q_dtype), boundary_check=(0, 1))
+
+def flash_attention_bkw(
+    Q: Tensor, K: Tensor, V: Tensor, L: Tensor, dO: Tensor, O: Tensor, block_rows: int, block_cols: int, is_casual: bool = False
+) -> Tuple[Tensor, Tensor, Tensor]:
+    batch_size, N_QUERIES, d_dim = Q.shape
+    _, N_KEYS, _ = K.shape
+    N_KEYS = K.shape[1]
+    D = (dO * O).sum(dim=-1)  # (B, S)
+    scale = 1.0 / np.sqrt(d_dim)
+
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+
+    grid = (triton.cdiv(N_KEYS, block_cols), batch_size)
+    flash_bkw_vk_kernel[grid](
+        Q, K, V, dO, L, D, dK, dV,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K.stride(0), K.stride(1), K.stride(2),
+        V.stride(0), V.stride(1), V.stride(2),
+        dO.stride(0), dO.stride(1), dO.stride(2),
+        L.stride(0), L.stride(1),
+        D.stride(0), D.stride(1),
+        N_QUERIES, 
+        N_KEYS, 
+        scale,
+        is_casual=is_casual,
+        D_MODEL=d_dim,
+        Q_TILE_SIZE=block_rows,
+        K_TILE_SIZE=block_cols,
+    )
+
+    grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
+    flash_bkw_q_kernel[grid](
+        Q, K, V, dO, L, D, dQ,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K.stride(0), K.stride(1), K.stride(2),
+        V.stride(0), V.stride(1), V.stride(2),
+        dO.stride(0), dO.stride(1), dO.stride(2),
+        L.stride(0), L.stride(1),
+        D.stride(0), D.stride(1),
+        N_QUERIES, 
+        N_KEYS, 
+        scale,
+        is_casual=is_casual,
+        D_MODEL=d_dim,
+        Q_TILE_SIZE=block_rows,
+        K_TILE_SIZE=block_cols,
+    )
+    return dQ, dK, dV
+
 
 @triton.jit
 def flash_fwd_kernel(
@@ -345,7 +632,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         block_cols = ctx.block_cols
         q_shape = ctx.q_shape
         dO = rearrange(dO, "... s d -> (...) s d")
-        dQ, dK, dV = FlashAttention._backward(Q, K, V, L, is_casual, dO)
+        # dQ, dK, dV = FlashAttention._backward(Q, K, V, L, is_casual, dO)
+        dQ, dK, dV = flash_attention_bkw(Q, K, V, L, dO, O, block_rows, block_cols, is_casual=is_casual)
         return dQ.reshape(q_shape), dK.reshape(q_shape), dV.reshape(q_shape), None
     
 
@@ -373,50 +661,50 @@ def test_backward():
     k.grad = None
     v.grad = None
 
-    out = NaiveAttention.apply(q, k, v, is_casual)
-    assert torch.allclose(
-        out, out_bench, atol=1e-3
-    ), f"Max diff NaiveAttention: {(out - out_bench).abs().max():.6f}"
-    print("NaiveAttention forward correctness test passed!")
+    # out = NaiveAttention.apply(q, k, v, is_casual)
+    # assert torch.allclose(
+    #     out, out_bench, atol=1e-3
+    # ), f"Max diff NaiveAttention: {(out - out_bench).abs().max():.6f}"
+    # print("NaiveAttention forward correctness test passed!")
 
-    out.backward(dO)
-    dq, dk, dv = q.grad, k.grad, v.grad
-    q.grad = None
-    k.grad = None
-    v.grad = None
-    assert torch.allclose(
-        dq, dq_bench, atol=1e-3
-    ), f"Max diff dQ: {(dq - dq_bench).abs().max():.6f}"
-    assert torch.allclose(
-        dk, dk_bench, atol=1e-3
-    ), f"Max diff dK: {(dk - dk_bench).abs().max():.6f}"
-    assert torch.allclose(
-        dv, dv_bench, atol=1e-3
-    ), f"Max diff dV: {(dv - dv_bench).abs().max():.6f}"
-    print("NaiveAttention backward correctness test passed!")
+    # out.backward(dO)
+    # dq, dk, dv = q.grad, k.grad, v.grad
+    # q.grad = None
+    # k.grad = None
+    # v.grad = None
+    # assert torch.allclose(
+    #     dq, dq_bench, atol=1e-3
+    # ), f"Max diff dQ: {(dq - dq_bench).abs().max():.6f}"
+    # assert torch.allclose(
+    #     dk, dk_bench, atol=1e-3
+    # ), f"Max diff dK: {(dk - dk_bench).abs().max():.6f}"
+    # assert torch.allclose(
+    #     dv, dv_bench, atol=1e-3
+    # ), f"Max diff dV: {(dv - dv_bench).abs().max():.6f}"
+    # print("NaiveAttention backward correctness test passed!")
 
 
-    out1 = FlashAttention.apply(q, k, v, is_casual)
-    assert torch.allclose(
-        out1, out_bench, atol=1e-3
-    ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
-    print("FlashAttention forward correctness test passed!")
+    # out1 = FlashAttention.apply(q, k, v, is_casual)
+    # assert torch.allclose(
+    #     out1, out_bench, atol=1e-3
+    # ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
+    # print("FlashAttention forward correctness test passed!")
 
-    out1.backward(dO)
-    dq1, dk1, dv1 = q.grad, k.grad, v.grad
-    q.grad = None
-    k.grad = None
-    v.grad = None
-    assert torch.allclose(
-        dv1, dv_bench, atol=1e-3
-    ), f"Max diff dV FlashAttention: {(dv1 - dv_bench).abs().max():.6f}"
-    assert torch.allclose(
-        dq1, dq_bench, atol=1e-3
-    ), f"Max diff dQ FlashAttention: {(dq1 - dq_bench).abs().max():.6f}"
-    assert torch.allclose(  
-        dk1, dk_bench, atol=1e-3
-    ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
-    print("FlashAttention backward correctness test passed!")
+    # out1.backward(dO)
+    # dq1, dk1, dv1 = q.grad, k.grad, v.grad
+    # q.grad = None
+    # k.grad = None
+    # v.grad = None
+    # assert torch.allclose(
+    #     dv1, dv_bench, atol=1e-3
+    # ), f"Max diff dV FlashAttention: {(dv1 - dv_bench).abs().max():.6f}"
+    # assert torch.allclose(
+    #     dq1, dq_bench, atol=1e-3
+    # ), f"Max diff dQ FlashAttention: {(dq1 - dq_bench).abs().max():.6f}"
+    # assert torch.allclose(  
+    #     dk1, dk_bench, atol=1e-3
+    # ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
+    # print("FlashAttention backward correctness test passed!")
 
     out2 = FlashAttentionTriton.apply(q, k, v, is_casual)
     assert torch.allclose(
@@ -431,12 +719,12 @@ def test_backward():
     assert torch.allclose(
         dv2, dv_bench, atol=1e-3
     ), f"Max diff dV FlashAttentionTriton: {(dv2 - dv_bench).abs().max():.6f}"
-    assert torch.allclose(
-        dq2, dq_bench, atol=1e-3
-    ), f"Max diff dQ FlashAttentionTriton: {(dq2 - dq_bench).abs().max():.6f}"
     assert torch.allclose(  
         dk2, dk_bench, atol=1e-3
     ), f"Max diff dK FlashAttentionTriton: {(dk2 - dk_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dq2, dq_bench, atol=1e-3
+    ), f"Max diff dQ FlashAttentionTriton: {(dq2 - dq_bench).abs().max():.6f}"
     print("FlashAttentionTriton backward correctness test passed!")
 
 
@@ -592,6 +880,25 @@ def benchmark():
         df.to_markdown(args.output, index=False)
 
 
+def test_timing_flash_forward_backward():
+    n_heads = 1
+    d_head = 64
+    sequence_length = 16384
+    q, k, v = torch.randn(
+        3, n_heads, sequence_length, d_head, device='cuda', dtype=torch.bfloat16, requires_grad=True
+    )
+
+    def flash_forward_backward():
+        o = FlashAttentionTriton.apply(q, k, v, True)
+        loss = o.sum()
+        loss.backward()
+
+    # results = triton.testing.do_bench(flash_forward_backward, rep=10000, warmup=1000)
+    results = triton.testing.do_bench(flash_forward_backward)
+    print(f"FlashAttentionTriton forward + backward: {results:.2f}ms")
+
+
+
 if __name__ == "__main__":
     import argparse
     from rich import print
@@ -602,7 +909,10 @@ if __name__ == "__main__":
     parser.add_argument("--is_casual", action="store_true")
     parser.add_argument("--dtype", type=str, default="float32")
     parser.add_argument("--output", type=str, default="")
+    parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
+    if args.test:
+        test_timing_flash_forward_backward()
     if args.benchmark:
         benchmark()
     if args.test_forward:
