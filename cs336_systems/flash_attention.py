@@ -29,14 +29,14 @@ class NaiveAttention(torch.autograd.Function):
         row_sum = torch.sum(p, dim=-1, keepdim=True)  # (B, S, 1)
         p = p / row_sum  # (B, S, S)
         o = einsum(p, V, "b i j, b j d -> b i d")  # (B, S, D)
-        ctx.save_for_backward(Q, K, V, o, p)
+        ctx.save_for_backward(Q, K, V, p)
         ctx.is_casual = is_casual
         ctx.q_shape = q_shape
         return o.reshape(q_shape)
 
     @staticmethod
     def backward(ctx, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
-        Q, K, V, O, P = ctx.saved_tensors
+        Q, K, V, P = ctx.saved_tensors
         is_casual = ctx.is_casual
         q_shape = ctx.q_shape
         dO = rearrange(dO, "... s d -> (...) s d")
@@ -95,7 +95,7 @@ class FlashAttention(torch.autograd.Function):
             l_i = torch.zeros(
                 (batch_size, block_rows), device=Q.device
             )  # (B, block_rows)
-            for j in range(num_block_cols):
+            for j in range(num_block_cols if not is_casual else min(i + 1, num_block_cols)):
                 k_j = K[
                     :, j * block_cols : (j + 1) * block_cols, :
                 ]  # (B, block_cols, D)
@@ -104,13 +104,10 @@ class FlashAttention(torch.autograd.Function):
                 ]  # (B, block_cols, D)
                 assert k_j.shape == (batch_size, block_cols, d_model)
                 assert v_j.shape == (batch_size, block_cols, d_model)
-                if is_casual and j > i:
-                    continue
-                else:
-                    s_ij = (
-                        einsum(q_i, k_j, "b i d, b j d -> b i j") / sqrt_d
-                    )  # (B, block_rows, block_cols)
-                    assert s_ij.shape == (batch_size, block_rows, block_cols)
+                s_ij = (
+                    einsum(q_i, k_j, "b i d, b j d -> b i j") / sqrt_d
+                )  # (B, block_rows, block_cols)
+                assert s_ij.shape == (batch_size, block_rows, block_cols)
                 if is_casual and j == i:
                     s_ij = torch.where(mask, s_ij, -1e6)
 
@@ -142,7 +139,7 @@ class FlashAttention(torch.autograd.Function):
             final_o[:, i * block_rows : (i + 1) * block_rows, :] = o_i
             final_l[:, i * block_rows : (i + 1) * block_rows] = m_i + torch.log(l_i)
 
-        ctx.save_for_backward(Q, K, V, final_o, final_l)
+        ctx.save_for_backward(Q, K, V, final_l)
         ctx.is_casual = is_casual
         ctx.block_rows = block_rows
         ctx.block_cols = block_cols
@@ -151,19 +148,40 @@ class FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
-        Q, K, V, O, L = ctx.saved_tensors
+        Q, K, V, L = ctx.saved_tensors
         is_casual = ctx.is_casual
         block_rows = ctx.block_rows
         block_cols = ctx.block_cols
         q_shape = ctx.q_shape
-
-        dQ, dK, dV = FlashAttention._backward(Q, K, V, O, L, is_casual, block_rows, block_cols, dO)
+        dO = rearrange(dO, "... s d -> (...) s d")
+        dQ, dK, dV = FlashAttention._backward(Q, K, V, L, is_casual, dO)
         return dQ.reshape(q_shape), dK.reshape(q_shape), dV.reshape(q_shape), None
 
     
     @staticmethod
-    def _backward(Q: Tensor, K: Tensor, V: Tensor, O: Tensor, L: Tensor, is_casual: bool, block_rows: int, block_cols: int, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        pass
+    @torch.compile
+    def _backward(Q: Tensor, K: Tensor, V: Tensor, L: Tensor, is_casual: bool, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        batch_size, context_len, d_model = Q.shape
+        sqrt_d = np.sqrt(d_model)
+        S = Q @ K.transpose(-2, -1) / sqrt_d  # (B, S, S)
+        if is_casual:
+            mask = torch.tril(torch.ones((context_len, context_len), device=Q.device)).unsqueeze(0)  # (1, S, S)
+            mask = mask.to(torch.bool)
+            S = torch.where(mask, S, float("-inf"))
+        P = torch.exp(S - L.unsqueeze(-1))  # (B, S, S)
+        assert P.shape == (batch_size, context_len, context_len)
+        dV = P.transpose(-2, -1) @ dO  # (B, D, S) @ (B, S, D) -> (B, D, D)
+
+        dP = dO @ V.transpose(-2, -1)  # (B, S, D) @ (B, D, S) -> (B, S, S)
+        dS = P * (dP  - torch.sum(dP * P, dim=-1, keepdim=True))  # (B, S, S)
+        if is_casual:
+            mask = torch.tril(torch.ones((context_len, context_len), device=Q.device)).unsqueeze(0)  # (1, S, S)
+            mask = mask.to(torch.bool)
+            dS = torch.where(mask, dS, 0.0)
+
+        dQ = dS @ K / sqrt_d  # (B, S, D)
+        dK = dS.transpose(-2, -1) @ Q / sqrt_d  # (B, S, D)
+        return dQ, dK, dV
 
 
 
@@ -348,10 +366,13 @@ def test_backward():
     assert torch.allclose(
         out, out_bench, atol=1e-3
     ), f"Max diff NaiveAttention: {(out - out_bench).abs().max():.6f}"
-    print("forward correctness test passed!")
+    print("NaiveAttention forward correctness test passed!")
 
     out.backward(dO)
     dq, dk, dv = q.grad, k.grad, v.grad
+    q.grad = None
+    k.grad = None
+    v.grad = None
     assert torch.allclose(
         dq, dq_bench, atol=1e-3
     ), f"Max diff dQ: {(dq - dq_bench).abs().max():.6f}"
@@ -361,7 +382,30 @@ def test_backward():
     assert torch.allclose(
         dv, dv_bench, atol=1e-3
     ), f"Max diff dV: {(dv - dv_bench).abs().max():.6f}"
-    print("backward correctness test passed!")
+    print("NaiveAttention backward correctness test passed!")
+
+
+    out1 = FlashAttention.apply(q, k, v, is_casual)
+    assert torch.allclose(
+        out1, out_bench, atol=1e-3
+    ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
+    print("FlashAttention forward correctness test passed!")
+
+    out1.backward(dO)
+    dq1, dk1, dv1 = q.grad, k.grad, v.grad
+    q.grad = None
+    k.grad = None
+    v.grad = None
+    assert torch.allclose(
+        dv1, dv_bench, atol=1e-3
+    ), f"Max diff dV FlashAttention: {(dv1 - dv_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dq1, dq_bench, atol=1e-3
+    ), f"Max diff dQ FlashAttention: {(dq1 - dq_bench).abs().max():.6f}"
+    assert torch.allclose(  
+        dk1, dk_bench, atol=1e-3
+    ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
+    print("FlashAttention backward correctness test passed!")
 
 def test_forward():
     torch.manual_seed(0)
