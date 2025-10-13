@@ -422,7 +422,7 @@ def flash_bkw_q_kernel(
         if is_casual and (col_id == row_id):
             dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ = tl.dot(dS.to(tl.float32), k.to(tl.float32), acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
+        dQ = tl.dot(dS.to, k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
