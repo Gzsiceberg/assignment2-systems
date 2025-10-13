@@ -20,8 +20,8 @@ def dist_main(rank, config: DistributedConfig):
     setup(rank, config)
     torch.manual_seed(0 + rank)
     device = torch.device(f'cuda:{rank}' if config.backend == 'nccl' else 'cpu')
-    input_dim = 64
-    output_dim = 10
+    input_dim = 128
+    output_dim = 2
     batch_size = 128
     model = torch.nn.Linear(input_dim, output_dim, bias=False).to(device)
     # weight = model.weight
@@ -67,12 +67,6 @@ def dist_main(rank, config: DistributedConfig):
 
     base_loss = torch.tensor(0.0)
     for epoch in range(200):
-        if rank == 0:
-            base_output = base_model(X_batch)
-            base_loss = torch.nn.functional.mse_loss(base_output, Y_batch)
-            base_loss.backward()
-            base_opt.step()
-            base_opt.zero_grad()
 
         output = model(X)
         loss = torch.nn.functional.mse_loss(output, Y)
@@ -84,6 +78,17 @@ def dist_main(rank, config: DistributedConfig):
                 if param.grad is not None:
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
                     param.grad.mul_(1.0 / config.world_size)
+        if rank == 0:
+            base_output = base_model(X_batch)
+            base_loss = torch.nn.functional.mse_loss(base_output, Y_batch)
+            base_loss.backward()
+            for p0, p1 in zip(base_model.parameters(), model.parameters()):
+                if p0.grad is None or p1.grad is None:
+                    raise ValueError("Gradient is None")
+                if not torch.allclose(p0.grad, p1.grad, atol=1e-5):
+                    raise ValueError("Gradients are not close!")
+            base_opt.step()
+            base_opt.zero_grad()
         opt.step()
         opt.zero_grad()
 
