@@ -287,23 +287,42 @@ def flash_bkw_vk_kernel(
         L_block_ptr = L_block_ptr.advance((row_start * Q_TILE_SIZE,))
         D_block_ptr = D_block_ptr.advance((row_start * Q_TILE_SIZE,))
 
-    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
     dV = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
     dK = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
-    for row in range(row_start, row_nums):
+
+    if is_casual:
         q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
         dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
         l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
         d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
 
         s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual and (row == col_id):
-            s = tl.where(mask, s, -1e6)
+        mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+        s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
         dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual and (row == col_id):
+        if is_casual:
             dP = tl.where(mask, dP, 0.0)
+        dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dK = tl.dot(tl.trans(dS.to(q.dtype)), q, acc=dK)  # (K_TILE_SIZE, D)
+
+        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,)) 
+        row_start += 1
+
+    for _ in range(row_start, row_nums):
+        q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+        dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
+        l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+        d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
+
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
+        dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
         dK = tl.dot(tl.trans(dS.to(tl.float32)), q.to(tl.float32), acc=dK)  # (K_TILE_SIZE, D)
 
@@ -402,30 +421,37 @@ def flash_bkw_q_kernel(
 
     col_nums = tl.cdiv(N_KEYS, K_TILE_SIZE)
     if is_casual:
-        col_nums = min(col_nums, row_id + 1)
+        col_nums = min(col_nums, row_id)
     q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
     dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
     l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
     d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
-    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
-
     dQ = tl.zeros((Q_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (Q_TILE_SIZE, D_MODEL)
-    for col_id in range(col_nums):
+    for _ in range(col_nums):
         k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
         v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
         s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual and (col_id == row_id):
-            s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
 
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual and (col_id == row_id):
-            dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ = tl.dot(dS.to(tl.float32), k.to(tl.float32), acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
+        dQ = tl.dot(dS.to(k.dtype), k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+    
+    if is_casual:
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+        s = tl.where(mask, s, -1e6)
+        p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
+        if is_casual:
+            dP = tl.where(mask, dP, 0.0)
+        dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        dQ = tl.dot(dS.to(k.dtype), k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
 
     q_dtype = Q_block_ptr.type.element_ty
     tl.store(dQ_block_ptr, dQ.to(q_dtype), boundary_check=(0, 1))
@@ -531,16 +557,13 @@ def flash_fwd_kernel(
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)  # (Q_TILE_SIZE,)
 
     num_cols = tl.cdiv(N_KEYS, K_TILE_SIZE)
-    mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
     if is_casual:
-        num_cols = min(num_cols, row_id + 1)
-    for col_id in tl.range(num_cols):
+        num_cols = min(num_cols, row_id)
+    for _ in tl.range(num_cols):
         k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
         v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
 
         s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual and (col_id == row_id):
-            s = tl.where(mask, s, -1e6)
         row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
         m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
 
@@ -548,14 +571,35 @@ def flash_fwd_kernel(
         exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
         l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
 
-        p = tl.cast(p, v.dtype)  # (Q_TILE_SIZE, K_TILE_SIZE)
-        o = tl.dot(p, v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
+        o = tl.dot(p.to(v.dtype), v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
 
         K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
         V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
 
         m = m_new
         l = l_new
+
+
+    if is_casual:
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D)
+        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
+        s = tl.where(mask, s, -1e6)
+
+        row_max = tl.max(s, axis=1)  # (Q_TILE_SIZE,)
+        m_new = tl.maximum(m, row_max)  # (Q_TILE_SIZE,)
+
+        p = tl.exp(s - m_new[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+        exp_m = tl.exp(m - m_new)  # (Q_TILE_SIZE,)
+        l_new = exp_m * l + tl.sum(p, axis=1)  # (Q_TILE_SIZE,)
+
+        o = tl.dot(p.to(v.dtype), v, acc=o * exp_m[:, None])  # (Q_TILE_SIZE, D)
+
+        m = m_new
+        l = l_new    
+
+
     final_o = o / l[:, None]  # (Q_TILE_SIZE, D)
     final_o = tl.cast(final_o, V_block_ptr.type.element_ty)  # (Q_TILE_SIZE, D)
     final_l = m + tl.log(l)  # (Q_TILE_SIZE,)
@@ -577,7 +621,7 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )  # (Q_TILE_SIZE,)
-    tl.store(L_block_ptr, final_l, boundary_check=(0,))
+    tl.store(L_block_ptr, final_l.to(V_block_ptr.type.element_ty), boundary_check=(0,))
         
 
 def flash_attention_fwd(
@@ -589,7 +633,7 @@ def flash_attention_fwd(
     batch_size, N_QUERIES, d_dim = Q.shape
     N_KEYS = K.shape[1]
     O = torch.empty_like(V)
-    L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=torch.float32)
+    L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=V.dtype)
     scale = 1.0 / np.sqrt(d_dim)
     grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
 
