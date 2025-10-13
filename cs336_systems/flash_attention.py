@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 import numpy as np
 from einops import rearrange, einsum
+from cs336_basics.model import scaled_dot_product_attention
 
 
 class NaiveAttention(torch.autograd.Function):
@@ -323,6 +324,11 @@ class FlashAttentionTriton(torch.autograd.Function):
         Q = rearrange(Q, "... s d -> (...) s d")
         K = rearrange(K, "... s d -> (...) s d")
         V = rearrange(V, "... s d -> (...) s d")
+        context_len = Q.shape[1]
+        if context_len < 4096:
+            block_rows, block_cols = 16, 16
+        else:
+            block_rows, block_cols = 32, 32
         O, L = flash_attention_fwd(Q, K, V, block_rows, block_cols, is_casual=is_casual)
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_casual = is_casual
@@ -333,9 +339,14 @@ class FlashAttentionTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
-        raise NotImplementedError(
-            "FlashAttention backward pass is not implemented yet."
-        )
+        Q, K, V, O, L = ctx.saved_tensors
+        is_casual = ctx.is_casual
+        block_rows = ctx.block_rows
+        block_cols = ctx.block_cols
+        q_shape = ctx.q_shape
+        dO = rearrange(dO, "... s d -> (...) s d")
+        dQ, dK, dV = FlashAttention._backward(Q, K, V, L, is_casual, dO)
+        return dQ.reshape(q_shape), dK.reshape(q_shape), dV.reshape(q_shape), None
     
 
 def test_backward():
@@ -407,6 +418,28 @@ def test_backward():
     ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
     print("FlashAttention backward correctness test passed!")
 
+    out2 = FlashAttentionTriton.apply(q, k, v, is_casual)
+    assert torch.allclose(
+        out2, out_bench, atol=1e-3
+    ), f"Max diff FlashAttentionTriton: {(out2 - out_bench).abs().max():.6f}"
+    print("FlashAttentionTriton forward correctness test passed!")
+    out2.backward(dO)
+    dq2, dk2, dv2 = q.grad, k.grad, v.grad
+    q.grad = None
+    k.grad = None
+    v.grad = None
+    assert torch.allclose(
+        dv2, dv_bench, atol=1e-3
+    ), f"Max diff dV FlashAttentionTriton: {(dv2 - dv_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dq2, dq_bench, atol=1e-3
+    ), f"Max diff dQ FlashAttentionTriton: {(dq2 - dq_bench).abs().max():.6f}"
+    assert torch.allclose(  
+        dk2, dk_bench, atol=1e-3
+    ), f"Max diff dK FlashAttentionTriton: {(dk2 - dk_bench).abs().max():.6f}"
+    print("FlashAttentionTriton backward correctness test passed!")
+
+
 def test_forward():
     torch.manual_seed(0)
     is_casual = args.is_casual
@@ -457,13 +490,114 @@ def test_forward():
     print(f"PyTorch Attention: {mean_ms:.2f}ms")
 
 
+def do_benchmark(context_len, d_model, is_casual, all_data: dict):
+    batch_size = 1
+    q = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    k = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    v = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    mask = torch.tril(torch.ones(context_len, context_len)).cuda()
+    mask = mask.to(torch.bool)
+    mask = rearrange(mask, "i j -> 1 i j")
+
+    mean_ms = triton.testing.do_bench(lambda: FlashAttentionTriton.apply(q, k, v, is_casual), quantiles=[0.5])
+    print(f"FlashAttentionTriton: {mean_ms:.2f}ms")
+    all_data["flash_attention_fw"].append(mean_ms)
+
+    mean_ms = triton.testing.do_bench(lambda: scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None), quantiles=[0.5])
+    print(f"PyTorch Attention: {mean_ms:.2f}ms")
+    all_data["pytorch_fw"].append(mean_ms)
+
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    out = FlashAttentionTriton.apply(q, k, v, is_casual)
+    dO = torch.rand_like(out)
+    def fn01():
+        out.backward(dO, retain_graph=True)
+        q.grad = None
+        k.grad = None
+        v.grad = None
+    mean_ms = triton.testing.do_bench(fn01, quantiles=[0.5])
+    print(f"FlashAttentionTriton backward: {mean_ms:.2f}ms")
+    all_data["flash_attention_bw"].append(mean_ms)
+
+    out = scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None)
+    def fn02():
+        out.backward(dO, retain_graph=True)
+        q.grad = None
+        k.grad = None
+        v.grad = None
+    mean_ms = triton.testing.do_bench(fn02, quantiles=[0.5])
+    print(f"PyTorch Attention backward: {mean_ms:.2f}ms")
+    all_data["pytorch_bw"].append(mean_ms)
+
+    def fn03():
+        out = FlashAttentionTriton.apply(q, k, v, is_casual)
+        out.backward(dO)
+        q.grad = None
+        k.grad = None
+        v.grad = None
+    mean_ms = triton.testing.do_bench(fn03, quantiles=[0.5])
+    print(f"FlashAttentionTriton total: {mean_ms:.2f}ms")
+    all_data["flash_attention_total"].append(mean_ms)
+
+    def fn04():
+        out = scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None)
+        out.backward(dO)
+        q.grad = None
+        k.grad = None
+        v.grad = None
+    mean_ms = triton.testing.do_bench(fn04, quantiles=[0.5])
+    print(f"PyTorch Attention total: {mean_ms:.2f}ms")
+    all_data["pytorch_total"].append(mean_ms)
+
+
+def benchmark():
+    torch.manual_seed(0)
+    is_casual = args.is_casual
+
+    all_data = {
+        "context_len": [],
+        "d_model": [],
+        "flash_attention_fw": [],
+        "pytorch_fw": [],
+        "flash_attention_bw": [],
+        "pytorch_bw": [],
+        "flash_attention_total": [],
+        "pytorch_total": [],
+
+    }
+    context_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    # context_lens = [8192,]
+    d_models = [16, 32, 64, 128]
+    # d_models = [64,]
+    for context_len in context_lens:
+        for d_model in d_models:
+            print("-" * 80)
+            print(f"Benchmarking context_len={context_len}, d_model={d_model}")
+            all_data["context_len"].append(context_len)
+            all_data["d_model"].append(d_model)
+            do_benchmark(context_len, d_model, is_casual, all_data)
+    import pandas as pd
+    df = pd.DataFrame(all_data)
+    df["FWD"] = df["pytorch_fw"] / df["flash_attention_fw"]
+    df["BWD"] = df["pytorch_bw"] / df["flash_attention_bw"]
+    df["TOTAL"] = df["pytorch_total"] / df["flash_attention_total"]
+    pd.set_option("display.float_format", "{:.2f}".format)
+    print(df)
+
+
 if __name__ == "__main__":
     import argparse
+    from rich import print
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--test_forward", action="store_true")
     parser.add_argument("-b", "--test_backward", action="store_true")
+    parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--is_casual", action="store_true")
     args = parser.parse_args()
+    if args.benchmark:
+        benchmark()
     if args.test_forward:
         test_forward()
     if args.test_backward:
