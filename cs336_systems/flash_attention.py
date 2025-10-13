@@ -203,14 +203,6 @@ def flash_bkw_vk_kernel(
 ):
     col_id = tl.program_id(0)
     batch_id = tl.program_id(1)
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_id * stride_qb,
-        shape=(N_QUERIES, D_MODEL),
-        strides=(stride_qq, stride_qd),
-        offsets=(0, 0),
-        block_shape=(Q_TILE_SIZE, D_MODEL),
-        order=(1, 0),
-    )  # (Q_TILE_SIZE, D)
 
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_id * stride_kb,
@@ -221,6 +213,15 @@ def flash_bkw_vk_kernel(
         order=(1, 0),
     )  # (K_TILE_SIZE, D)
 
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr + batch_id * stride_kb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_kk, stride_kd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_id * stride_vb,
         shape=(N_KEYS, D_MODEL),
@@ -229,6 +230,24 @@ def flash_bkw_vk_kernel(
         block_shape=(K_TILE_SIZE, D_MODEL),
         order=(1, 0),
     )  # (K_TILE_SIZE, D)
+
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_id * stride_vb,
+        shape=(N_KEYS, D_MODEL),
+        strides=(stride_vk, stride_vd),
+        offsets=(col_id * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (K_TILE_SIZE, D_MODEL)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_id * stride_qb,
+        shape=(N_QUERIES, D_MODEL),
+        strides=(stride_qq, stride_qd),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_MODEL),
+        order=(1, 0),
+    )  # (Q_TILE_SIZE, D)
 
     dO_block_ptr = tl.make_block_ptr(
         dO_ptr + batch_id * stride_ob,
@@ -260,13 +279,18 @@ def flash_bkw_vk_kernel(
     k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
     v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (K_TILE_SIZE, D_MODEL)
     row_nums = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
-    start_row = 0
+    row_start = 0
     if is_casual:
-        start_row = col_id
+        row_start = col_id
+        Q_block_ptr = Q_block_ptr.advance((row_start * Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((row_start * Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((row_start * Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((row_start * Q_TILE_SIZE,))
+
     mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
     dV = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
     dK = tl.zeros((K_TILE_SIZE, D_MODEL), dtype=tl.float32)  # (K_TILE_SIZE, D_MODEL)
-    for row in range(start_row, row_nums):
+    for row in range(row_start, row_nums):
         q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
         dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")  # (Q_TILE_SIZE, D_MODEL)
         l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
@@ -276,12 +300,12 @@ def flash_bkw_vk_kernel(
         if is_casual and (row == col_id):
             s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dV = tl.dot(tl.trans(p), dO, acc=dV)  # (K_TILE_SIZE, D)
+        dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
         if is_casual and (row == col_id):
             dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dK = tl.dot(tl.trans(dS), q, acc=dK)  # (K_TILE_SIZE, D)
+        dK = tl.dot(tl.trans(dS.to(tl.float32)), q.to(tl.float32), acc=dK)  # (K_TILE_SIZE, D)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -289,25 +313,9 @@ def flash_bkw_vk_kernel(
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
 
     k_dtype = K_block_ptr.type.element_ty
-    dK_block_ptr = tl.make_block_ptr(
-        dK_ptr + batch_id * stride_kb,
-        shape=(N_KEYS, D_MODEL),
-        strides=(stride_kk, stride_kd),
-        offsets=(col_id * K_TILE_SIZE, 0),
-        block_shape=(K_TILE_SIZE, D_MODEL),
-        order=(1, 0),
-    )  # (K_TILE_SIZE, D_MODEL)
     tl.store(dK_block_ptr, dK.to(k_dtype), boundary_check=(0, 1))
 
     v_dtype = V_block_ptr.type.element_ty
-    dV_block_ptr = tl.make_block_ptr(
-        dV_ptr + batch_id * stride_vb,
-        shape=(N_KEYS, D_MODEL),
-        strides=(stride_vk, stride_vd),
-        offsets=(col_id * K_TILE_SIZE, 0),
-        block_shape=(K_TILE_SIZE, D_MODEL),
-        order=(1, 0),
-    )  # (K_TILE_SIZE, D_MODEL)
     tl.store(dV_block_ptr, dV.to(v_dtype), boundary_check=(0, 1))
 
 @triton.jit
@@ -414,7 +422,7 @@ def flash_bkw_q_kernel(
         if is_casual and (col_id == row_id):
             dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ = tl.dot(dS, k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
+        dQ = tl.dot(dS.to(tl.float32), k.to(tl.float32), acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -654,57 +662,57 @@ def test_backward():
     from cs336_basics.model import scaled_dot_product_attention
     out_bench = scaled_dot_product_attention(q, k, v, mask=mask if is_casual else None)
 
-    dO = torch.rand_like(out_bench)
+    dO = torch.rand_like(out_bench) - 0.5
     out_bench.backward(dO)
     dq_bench, dk_bench, dv_bench = q.grad, k.grad, v.grad
     q.grad = None
     k.grad = None
     v.grad = None
 
-    # out = NaiveAttention.apply(q, k, v, is_casual)
-    # assert torch.allclose(
-    #     out, out_bench, atol=1e-3
-    # ), f"Max diff NaiveAttention: {(out - out_bench).abs().max():.6f}"
-    # print("NaiveAttention forward correctness test passed!")
+    out = NaiveAttention.apply(q, k, v, is_casual)
+    assert torch.allclose(
+        out, out_bench, atol=1e-3
+    ), f"Max diff NaiveAttention: {(out - out_bench).abs().max():.6f}"
+    print("NaiveAttention forward correctness test passed!")
 
-    # out.backward(dO)
-    # dq, dk, dv = q.grad, k.grad, v.grad
-    # q.grad = None
-    # k.grad = None
-    # v.grad = None
-    # assert torch.allclose(
-    #     dq, dq_bench, atol=1e-3
-    # ), f"Max diff dQ: {(dq - dq_bench).abs().max():.6f}"
-    # assert torch.allclose(
-    #     dk, dk_bench, atol=1e-3
-    # ), f"Max diff dK: {(dk - dk_bench).abs().max():.6f}"
-    # assert torch.allclose(
-    #     dv, dv_bench, atol=1e-3
-    # ), f"Max diff dV: {(dv - dv_bench).abs().max():.6f}"
-    # print("NaiveAttention backward correctness test passed!")
+    out.backward(dO)
+    dq, dk, dv = q.grad, k.grad, v.grad
+    q.grad = None
+    k.grad = None
+    v.grad = None
+    assert torch.allclose(
+        dq, dq_bench, atol=1e-3
+    ), f"Max diff dQ: {(dq - dq_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dk, dk_bench, atol=1e-3
+    ), f"Max diff dK: {(dk - dk_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dv, dv_bench, atol=1e-3
+    ), f"Max diff dV: {(dv - dv_bench).abs().max():.6f}"
+    print("NaiveAttention backward correctness test passed!")
 
 
-    # out1 = FlashAttention.apply(q, k, v, is_casual)
-    # assert torch.allclose(
-    #     out1, out_bench, atol=1e-3
-    # ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
-    # print("FlashAttention forward correctness test passed!")
+    out1 = FlashAttention.apply(q, k, v, is_casual)
+    assert torch.allclose(
+        out1, out_bench, atol=1e-3
+    ), f"Max diff FlashAttention: {(out1 - out_bench).abs().max():.6f}"
+    print("FlashAttention forward correctness test passed!")
 
-    # out1.backward(dO)
-    # dq1, dk1, dv1 = q.grad, k.grad, v.grad
-    # q.grad = None
-    # k.grad = None
-    # v.grad = None
-    # assert torch.allclose(
-    #     dv1, dv_bench, atol=1e-3
-    # ), f"Max diff dV FlashAttention: {(dv1 - dv_bench).abs().max():.6f}"
-    # assert torch.allclose(
-    #     dq1, dq_bench, atol=1e-3
-    # ), f"Max diff dQ FlashAttention: {(dq1 - dq_bench).abs().max():.6f}"
-    # assert torch.allclose(  
-    #     dk1, dk_bench, atol=1e-3
-    # ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
-    # print("FlashAttention backward correctness test passed!")
+    out1.backward(dO)
+    dq1, dk1, dv1 = q.grad, k.grad, v.grad
+    q.grad = None
+    k.grad = None
+    v.grad = None
+    assert torch.allclose(
+        dv1, dv_bench, atol=1e-3
+    ), f"Max diff dV FlashAttention: {(dv1 - dv_bench).abs().max():.6f}"
+    assert torch.allclose(
+        dq1, dq_bench, atol=1e-3
+    ), f"Max diff dQ FlashAttention: {(dq1 - dq_bench).abs().max():.6f}"
+    assert torch.allclose(  
+        dk1, dk_bench, atol=1e-3
+    ), f"Max diff dK FlashAttention: {(dk1 - dk_bench).abs().max():.6f}"
+    print("FlashAttention backward correctness test passed!")
 
     out2 = FlashAttentionTriton.apply(q, k, v, is_casual)
     assert torch.allclose(
