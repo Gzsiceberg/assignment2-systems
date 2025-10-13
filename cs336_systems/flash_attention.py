@@ -321,7 +321,7 @@ def flash_bkw_vk_kernel(
         mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
         s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
+        dV = tl.dot(tl.trans(p.to(dO.dtype)), dO, acc=dV)  # (K_TILE_SIZE, D)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
@@ -341,10 +341,10 @@ def flash_bkw_vk_kernel(
 
         s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
+        dV = tl.dot(tl.trans(p.to(dO.dtype)), dO, acc=dV)  # (K_TILE_SIZE, D)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dK = tl.dot(tl.trans(dS.to(tl.float32)), q.to(tl.float32), acc=dK)  # (K_TILE_SIZE, D)
+        dK = tl.dot(tl.trans(dS.to(q.dtype)), q, acc=dK)  # (K_TILE_SIZE, D)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -372,7 +372,7 @@ def flash_bkw_q_kernel(
     stride_ob, stride_oq, stride_od,
     stride_lb, stride_lq,
     stride_db, stride_dq,
-    N_QUERIES, N_KEYS, scale,
+    N_QUERIES, N_KEYS, scale: float,
     is_casual: tl.constexpr,
     D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
@@ -475,7 +475,7 @@ def flash_bkw_q_kernel(
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
         dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dQ = tl.dot(dS.to(k.dtype), k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
+        dQ = tl.dot(dS.to(k.dtype), k, acc=dQ) # (Q_TILE_SIZE, D_MODEL)
 
     q_dtype = Q_block_ptr.type.element_ty
     tl.store(dQ_block_ptr, dQ.to(q_dtype), boundary_check=(0, 1))
