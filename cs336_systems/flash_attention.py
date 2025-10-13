@@ -302,8 +302,7 @@ def flash_bkw_vk_kernel(
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
         dV = tl.dot(tl.trans(p.to(tl.float32)), dO.to(tl.float32), acc=dV)  # (K_TILE_SIZE, D)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual:
-            dP = tl.where(mask, dP, 0.0)
+        dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
         dK = tl.dot(tl.trans(dS.to(q.dtype)), q, acc=dK)  # (K_TILE_SIZE, D)
 
@@ -448,8 +447,7 @@ def flash_bkw_q_kernel(
         s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
         dP = tl.dot(dO, tl.trans(v))  # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_casual:
-            dP = tl.where(mask, dP, 0.0)
+        dP = tl.where(mask, dP, 0.0)
         dS = p * (dP - d[:, None]) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
         dQ = tl.dot(dS.to(k.dtype), k, acc=dQ)  # (Q_TILE_SIZE, D_MODEL)
 
@@ -933,7 +931,7 @@ def benchmark():
 
 
 def test_timing_flash_forward_backward():
-    n_heads = 1
+    n_heads = 8
     d_head = 64
     sequence_length = 16384
     q, k, v = torch.randn(
