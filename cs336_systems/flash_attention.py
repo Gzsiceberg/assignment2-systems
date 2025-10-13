@@ -490,11 +490,11 @@ def test_forward():
     print(f"PyTorch Attention: {mean_ms:.2f}ms")
 
 
-def do_benchmark(context_len, d_model, is_casual, all_data: dict):
+def do_benchmark(context_len, d_model, is_casual, all_data: dict, dtype=torch.float32):
     batch_size = 1
-    q = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
-    k = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
-    v = torch.rand(batch_size, context_len, d_model).cuda() - 0.5
+    q = torch.rand(batch_size, context_len, d_model, dtype=dtype).cuda() - 0.5
+    k = torch.rand(batch_size, context_len, d_model, dtype=dtype).cuda() - 0.5
+    v = torch.rand(batch_size, context_len, d_model, dtype=dtype).cuda() - 0.5
     mask = torch.tril(torch.ones(context_len, context_len)).cuda()
     mask = mask.to(torch.bool)
     mask = rearrange(mask, "i j -> 1 i j")
@@ -555,6 +555,7 @@ def do_benchmark(context_len, d_model, is_casual, all_data: dict):
 def benchmark():
     torch.manual_seed(0)
     is_casual = args.is_casual
+    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
 
     all_data = {
         "context_len": [],
@@ -577,7 +578,7 @@ def benchmark():
             print(f"Benchmarking context_len={context_len}, d_model={d_model}")
             all_data["context_len"].append(context_len)
             all_data["d_model"].append(d_model)
-            do_benchmark(context_len, d_model, is_casual, all_data)
+            do_benchmark(context_len, d_model, is_casual, all_data, dtype=dtype)
     import pandas as pd
     df = pd.DataFrame(all_data)
     df["FWD"] = df["pytorch_fw"] / df["flash_attention_fw"]
@@ -585,6 +586,10 @@ def benchmark():
     df["TOTAL"] = df["pytorch_total"] / df["flash_attention_total"]
     pd.set_option("display.float_format", "{:.2f}".format)
     print(df)
+
+    if args.output:
+        df = df.round(2)
+        df.to_markdown(args.output, index=False)
 
 
 if __name__ == "__main__":
@@ -595,6 +600,8 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--test_backward", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--is_casual", action="store_true")
+    parser.add_argument("--dtype", type=str, default="float32")
+    parser.add_argument("--output", type=str, default="")
     args = parser.parse_args()
     if args.benchmark:
         benchmark()
