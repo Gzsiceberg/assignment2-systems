@@ -1,9 +1,9 @@
+import math
 from typing import Tuple
 import triton
 from triton import language as tl
 import torch
 from torch import Tensor
-import numpy as np
 from einops import rearrange, einsum
 from cs336_basics.model import scaled_dot_product_attention
 
@@ -19,7 +19,7 @@ class NaiveAttention(torch.autograd.Function):
         K = rearrange(K, "... s d -> (...) s d")
         V = rearrange(V, "... s d -> (...) s d")
         batch_size, context_len, d_model = Q.shape
-        sqrt_d = np.sqrt(d_model)
+        sqrt_d = math.sqrt(d_model)
         scores = einsum(Q, K, "b i d, b j d -> b i j") / sqrt_d  # (B, S, S)
         if is_casual:
             mask = torch.tril(torch.ones((context_len, context_len), device=Q.device)).unsqueeze(0)  # (1, S, S)
@@ -43,7 +43,7 @@ class NaiveAttention(torch.autograd.Function):
         dO = rearrange(dO, "... s d -> (...) s d")
         batch_size, context_len, d_model = Q.shape
 
-        sqrt_d = np.sqrt(d_model)
+        sqrt_d = math.sqrt(d_model)
         dV = P.transpose(-2, -1) @ dO  # (B, D, query) @ (B, query, D) -> (B, D, D)
         assert dV.shape == (batch_size, context_len, d_model)
         dP = dO @ V.transpose(-2, -1)  # (B, query, key)
@@ -83,7 +83,7 @@ class FlashAttention(torch.autograd.Function):
 
         final_o = torch.empty_like(V)
         final_l = torch.empty((batch_size, context_len), device=Q.device)
-        sqrt_d = np.sqrt(d_model)
+        sqrt_d = math.sqrt(d_model)
         mask = torch.tril(torch.ones((block_rows, block_cols), device=Q.device)).unsqueeze(0)  # (1, block_rows, block_cols)
         mask = mask.to(torch.bool)
         for i in range(num_block_rows):
@@ -163,7 +163,7 @@ class FlashAttention(torch.autograd.Function):
     @torch.compile
     def _backward(Q: Tensor, K: Tensor, V: Tensor, L: Tensor, is_casual: bool, dO: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         batch_size, context_len, d_model = Q.shape
-        sqrt_d = np.sqrt(d_model)
+        sqrt_d = math.sqrt(d_model)
         S = Q @ K.transpose(-2, -1) / sqrt_d  # (B, S, S)
         if is_casual:
             mask = torch.tril(torch.ones((context_len, context_len), device=Q.device)).unsqueeze(0)  # (1, S, S)
@@ -195,7 +195,7 @@ def flash_bkw_vk_kernel(
     stride_ob, stride_oq, stride_od,
     stride_lb, stride_lq,
     stride_db, stride_dq,
-    N_QUERIES, N_KEYS, scale,
+    N_QUERIES, N_KEYS, scale: float,
     is_casual: tl.constexpr,
     D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
@@ -296,7 +296,7 @@ def flash_bkw_vk_kernel(
         l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
         d = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE,)
 
-        s = tl.dot(q, tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+        s = tl.dot(q.to(k.dtype), tl.trans(k)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
         mask = (tl.arange(0, Q_TILE_SIZE)[:, None]) >= (tl.arange(0, K_TILE_SIZE)[None, :])  # (K_TILE_SIZE, Q_TILE_SIZE)
         s = tl.where(mask, s, -1e6)
         p = tl.exp(s - l[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
@@ -461,7 +461,7 @@ def flash_attention_bkw(
     _, N_KEYS, _ = K.shape
     N_KEYS = K.shape[1]
     D = (dO * O).sum(dim=-1)  # (B, S)
-    scale = 1.0 / np.sqrt(d_dim)
+    scale = 1.0 / math.sqrt(d_dim)
 
     dQ = torch.zeros_like(Q)
     dK = torch.zeros_like(K)
@@ -632,7 +632,7 @@ def flash_attention_fwd(
     N_KEYS = K.shape[1]
     O = torch.empty_like(V)
     L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=V.dtype)
-    scale = 1.0 / np.sqrt(d_dim)
+    scale = 1.0 / math.sqrt(d_dim)
     grid = (triton.cdiv(N_QUERIES, block_rows), batch_size)
 
     flash_fwd_kernel[grid](
@@ -938,8 +938,10 @@ def test_timing_flash_forward_backward():
         3, n_heads, sequence_length, d_head, device='cuda', dtype=torch.bfloat16, requires_grad=True
     )
 
+    flash = torch.compile(FlashAttentionTriton.apply)
+
     def flash_forward_backward():
-        o = FlashAttentionTriton.apply(q, k, v, True)
+        o = flash(q, k, v, True)
         loss = o.sum()
         loss.backward()
 
