@@ -10,6 +10,7 @@ from timeit import default_timer as tx
 from cs336_basics import model
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from cs336_systems.ddp import DDPIndividualParameters
 
 
 @dataclass
@@ -17,6 +18,7 @@ class DistributedConfig:
     world_size: int = 4
     backend: str = "gloo"
     flat_grad: bool = False  # new flag to enable flat gradient synchronization
+    ddp: bool = False  # new flag to enable PyTorch DDP
 
 
 @dataclass
@@ -70,16 +72,19 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     context_length = llm_config.context_length
     batch_size = llm_config.batch_size
     if rank == 0:
-        print(f"Using backend: {config.backend}, world size: {config.world_size}, flat_grad: {config.flat_grad}")
+        print(f"Config: {config}")
         print(f"LLM Config: {llm_config}")
     llm, opt = setup_llm(llm_config)
     if config.backend == "nccl":
         llm.to(device)
-    # sync the model initialization across ranks
-    with torch.no_grad():
-        for param in llm.parameters():
-            dist.broadcast(param, src=0)
-    dist.barrier()
+    if config.ddp:
+        llm = DDPIndividualParameters(llm)
+    else:
+        # sync the model initialization across ranks
+        with torch.no_grad():
+            for param in llm.parameters():
+                dist.broadcast(param, src=0)
+        dist.barrier()
 
     input_ids = torch.randint(
         0, llm_config.vocab_size, (batch_size, context_length), device=device
@@ -103,20 +108,31 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         loss = cross_entropy(logits, targets)
         loss.backward()
 
-        # sync gradients
-        with torch.no_grad():
+        if config.ddp:
             if config.backend == "nccl":
                 torch.cuda.synchronize()
-
             all_reduce_start = tx()
-            sync_grads(config, llm)
-
-            if config.backend == "nccl":
-                torch.cuda.synchronize()
-
+            llm.finish_gradient_synchronization() # type: ignore
             all_reduce_end = tx()
             if epoch >= warmup_epochs:
                 all_reduce_times.append(all_reduce_end - all_reduce_start)
+            if config.backend == "nccl":
+                torch.cuda.synchronize()
+        else:
+            # sync gradients
+            with torch.no_grad():
+                if config.backend == "nccl":
+                    torch.cuda.synchronize()
+
+                all_reduce_start = tx()
+                sync_grads(config, llm)
+
+                if config.backend == "nccl":
+                    torch.cuda.synchronize()
+
+                all_reduce_end = tx()
+                if epoch >= warmup_epochs:
+                    all_reduce_times.append(all_reduce_end - all_reduce_start)
 
         opt.step()
         opt.zero_grad()
@@ -175,6 +191,7 @@ if __name__ == "__main__":
     parser.add_argument('--backend', type=str, default='gloo', choices=['gloo', 'nccl'], help='Distributed backend to use')
     parser.add_argument('--flat_grad', action='store_true', help='Enable flat gradient synchronization')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
+    parser.add_argument('--ddp', action='store_true', help='Use PyTorch DDP instead of naive implementation (for comparison)')
     args = parser.parse_args()
 
     if args.backend == "nccl":
@@ -188,6 +205,7 @@ if __name__ == "__main__":
     config.world_size = 2
     config.backend = args.backend
     config.flat_grad = args.flat_grad
+    config.ddp = args.ddp
 
     llm_config = LLMConfig()
     llm_config.batch_size = args.batch_size
