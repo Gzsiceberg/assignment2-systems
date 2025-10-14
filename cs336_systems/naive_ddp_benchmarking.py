@@ -64,7 +64,9 @@ def setup_llm(config: LLMConfig):
 def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     setup(rank, config)
     torch.manual_seed(0 + rank)
-    device = torch.device(f"cuda:{rank}" if config.backend == "nccl" else "cpu")
+    if config.backend == "nccl":
+        torch.cuda.set_device(rank)
+    device = torch.device(f"cuda" if config.backend == "nccl" else "cpu")
     context_length = llm_config.context_length
     batch_size = llm_config.batch_size
     llm, opt = setup_llm(llm_config)
