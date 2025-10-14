@@ -87,8 +87,8 @@ class DDPBucketedParameters(torch.nn.Module):
         grads = [param.grad for param in last_bucket if param.grad is not None]
         flat_grads = torch._utils._flatten_dense_tensors(grads) # type: ignore
         handle = dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=True)
-        if handle is not None:
-            self.handles.append((handle, flat_grads, grads, last_bucket))
+        assert handle is not None, f"Expected handle to be not None"
+        self.handles.append((handle, flat_grads, grads, last_bucket))
         end = tx()
         self.acc_all_reduce_time += end - start
         self.bucketed_params.append([])
