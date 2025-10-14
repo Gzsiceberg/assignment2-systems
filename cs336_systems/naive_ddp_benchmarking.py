@@ -70,6 +70,8 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     context_length = llm_config.context_length
     batch_size = llm_config.batch_size
     llm, opt = setup_llm(llm_config)
+    if config.backend == "nccl":
+        llm.to(device)
     # sync the model initialization across ranks
     with torch.no_grad():
         for param in llm.parameters():
