@@ -142,7 +142,10 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
             per_train_time = elapsed / (epoch + 1 - min(epoch + 1, warmup_epochs))
             avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times)
             percent_all_reduce = 100.0 * (avg_all_reduce_time / per_train_time)
-            print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}, Per-Train Time: {per_train_time:.4f}s Avg All-Reduce Time: {avg_all_reduce_time:.4f}s ({percent_all_reduce:.2f}%)")
+            debug_info = ""
+            if config.ddp:
+                debug_info = llm.get_debug_info() # type: ignore
+            print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}, Per-Train Time: {per_train_time:.4f}s Avg All-Reduce Time: {avg_all_reduce_time:.4f}s ({percent_all_reduce:.2f}%) {debug_info}")
         if epoch == warmup_epochs - 1:
             if config.backend == "nccl":
                 torch.cuda.synchronize()

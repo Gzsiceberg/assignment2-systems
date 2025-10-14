@@ -56,6 +56,10 @@ class DDPIndividualParameters(torch.nn.Module):
         self.acc_all_reduce_time += end - start
 
 
+    def get_debug_info(self) -> str:
+        return ""
+
+
 class DDPBucketedParameters(torch.nn.Module):
     def __init__(self, module: torch.nn.Module, bucket_size_mb: float):
         super().__init__()
@@ -71,17 +75,22 @@ class DDPBucketedParameters(torch.nn.Module):
         self.hooks = []
         self.acc_all_reduce_time = 0.0
         self.bucket_size_mb: float = bucket_size_mb
-        self.bucketed_params: list[list[torch.nn.Parameter]] = []
+        self.bucketed_params: list[torch.nn.Parameter] = []
         self.current_bucketed_size: int = 0
+        self.last_bucket_count: int = 0
         self._register_hooks()
+    
+    def get_debug_info(self) -> str:
+        return f"last_bucket_count={self.last_bucket_count}"
 
     def forward(self, *args, **kwargs):
         self.acc_all_reduce_time = 0.0
         return self.module(*args, **kwargs)
     
     def finish_gradient_synchronization(self):
-        self._handle_last_bucket()
+        self._all_reduce_bucket()
         start = tx()
+        self.last_bucket_count = len(self.handles)
         for handle, flat_grads, grads, last_bucket in self.handles:
             handle.wait()
             with torch.no_grad():
@@ -107,31 +116,27 @@ class DDPBucketedParameters(torch.nn.Module):
             self.hooks.append(h)
     
     def _add_to_bucket(self, param: torch.nn.Parameter) -> None:
-        if not self.bucketed_params:
-            self.bucketed_params.append([param])
-        else:
-            self.bucketed_params[-1].append(param)
         num_elements = param.numel()
         num_bytes = num_elements * param.element_size()
         self.current_bucketed_size += num_bytes
+        self.bucketed_params.append(param)
     
-    def _handle_last_bucket(self):
+    def _all_reduce_bucket(self):
         if self.current_bucketed_size == 0:
             return
         start = tx()
 
-        last_bucket = self.bucketed_params[-1]
-        grads = [param.grad for param in last_bucket if param.grad is not None]
+        grads = [param.grad for param in self.bucketed_params if param.grad is not None]
         flat_grads = torch._utils._flatten_dense_tensors(grads) # type: ignore
         handle = dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=True)
 
         assert handle is not None, f"Expected handle to be not None"
-        self.handles.append((handle, flat_grads, grads, last_bucket))
+        self.handles.append((handle, flat_grads, grads, self.bucketed_params))
 
         end = tx()
         self.acc_all_reduce_time += end - start
 
-        self.bucketed_params.append([])
+        self.bucketed_params = []
         self.current_bucketed_size = 0
 
     def _all_reduce_hook(self, param: torch.nn.Parameter) -> None:
@@ -141,4 +146,4 @@ class DDPBucketedParameters(torch.nn.Module):
             end = tx()
             self.acc_all_reduce_time += end - start
             return
-        self._handle_last_bucket()
+        self._all_reduce_bucket()
