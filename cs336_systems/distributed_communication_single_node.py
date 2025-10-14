@@ -43,6 +43,7 @@ def dist_demo(rank, config: DistributedConfig):
 
     all_times = [torch.zeros(1, device=device) for _ in range(config.world_size)]
     local_time = torch.tensor([avg_time], device=device)
+    # can't pass temp tensor directly in nccl backend, it must be a persistent tensor, otherwise it will cause inllegal memory access
     dist.all_gather(all_times, local_time)
 
     if rank == 0:
