@@ -69,6 +69,9 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     device = torch.device(f"cuda" if config.backend == "nccl" else "cpu")
     context_length = llm_config.context_length
     batch_size = llm_config.batch_size
+    if rank == 0:
+        print(f"Using backend: {config.backend}, world size: {config.world_size}, flat_grad: {config.flat_grad}")
+        print(f"LLM Config: {llm_config}")
     llm, opt = setup_llm(llm_config)
     if config.backend == "nccl":
         llm.to(device)
