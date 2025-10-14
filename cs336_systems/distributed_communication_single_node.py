@@ -47,6 +47,9 @@ def dist_demo(rank, config: DistributedConfig):
     if rank == 0:
         all_times = torch.cat(all_times)
         print(f"world_size={config.world_size} backend={config.backend} size={config.size}MB mean={all_times.mean():.6f}ms")
+    
+    dist.barrier()
+    dist.destroy_process_group()
 
 def run_sweep():
     gpu_count = torch.cuda.device_count()
