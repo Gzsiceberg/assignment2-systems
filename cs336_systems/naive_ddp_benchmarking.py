@@ -87,7 +87,7 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     autocast = llm_config.autocast
 
     start = tx()
-    epochs = 200
+    epochs = 100
     all_reduce_times = []
     warmup_epochs = 10
     for epoch in range(epochs):
@@ -125,7 +125,7 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     elapsed = end - start
     per_train_time = elapsed / (epochs - warmup_epochs)
     avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times)
-    stats = torch.tensor([per_train_time, avg_all_reduce_time])
+    stats = torch.tensor([per_train_time, avg_all_reduce_time], device=device)
     dist.reduce(stats, dst=0, op=dist.ReduceOp.SUM)
     if rank == 0:
         print(f"Average training time per epoch: {stats[0].item() / config.world_size:.4f} seconds")
@@ -164,6 +164,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--backend', type=str, default='gloo', choices=['gloo', 'nccl'], help='Distributed backend to use')
     parser.add_argument('--flat_grad', action='store_true', help='Enable flat gradient synchronization')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     args = parser.parse_args()
 
     if args.backend == "nccl":
@@ -179,6 +180,7 @@ if __name__ == "__main__":
     config.flat_grad = args.flat_grad
 
     llm_config = LLMConfig()
+    llm_config.batch_size = args.batch_size
     if config.backend == "gloo":
         llm_config.batch_size = 1
         llm_config.d_model = 8
