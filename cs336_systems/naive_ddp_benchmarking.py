@@ -10,7 +10,7 @@ from timeit import default_timer as tx
 from cs336_basics import model
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
-from cs336_systems.ddp import DDPIndividualParameters
+from cs336_systems.ddp import DDPBucketedParameters, DDPIndividualParameters
 
 
 @dataclass
@@ -19,6 +19,7 @@ class DistributedConfig:
     backend: str = "gloo"
     flat_grad: bool = False  # new flag to enable flat gradient synchronization
     ddp: bool = False  # new flag to enable PyTorch DDP
+    bucket_size: int = 1  # bucket size in MB for gradient synchronization (only for naive DDP)
 
 
 @dataclass
@@ -78,7 +79,10 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     if config.backend == "nccl":
         llm.to(device)
     if config.ddp:
-        llm = DDPIndividualParameters(llm)
+        if config.bucket_size > 0:
+            llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
+        else:
+            llm = DDPIndividualParameters(llm)
     else:
         # sync the model initialization across ranks
         with torch.no_grad():
@@ -188,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument('--flat_grad', action='store_true', help='Enable flat gradient synchronization')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--ddp', action='store_true', help='Use PyTorch DDP instead of naive implementation (for comparison)')
+    parser.add_argument('--bucket_size', type=int, default=0, help='Bucket size in MB for gradient synchronization (only for naive DDP)')
     args = parser.parse_args()
 
     if args.backend == "nccl":
@@ -202,6 +207,7 @@ if __name__ == "__main__":
     config.backend = args.backend
     config.flat_grad = args.flat_grad
     config.ddp = args.ddp
+    config.bucket_size = args.bucket_size
 
     llm_config = LLMConfig()
     llm_config.batch_size = args.batch_size
