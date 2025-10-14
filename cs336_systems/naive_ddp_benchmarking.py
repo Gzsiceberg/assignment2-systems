@@ -213,12 +213,13 @@ if __name__ == "__main__":
     llm_config = LLMConfig()
     llm_config.batch_size = args.batch_size
     if config.backend == "gloo":
-        llm_config.batch_size = 1
-        llm_config.d_model = 8
-        llm_config.num_layers = 2
+        llm_config.batch_size = 16
+        llm_config.d_model = 256
+        llm_config.d_ff = 4 * llm_config.d_model
+        llm_config.num_layers = 16
         llm_config.num_heads = 1
-        llm_config.context_length = 16
-        llm_config.vocab_size = 32
+        llm_config.context_length = 32
+        llm_config.vocab_size = 1000
         llm_config.lr = 1e-3
         llm_config.autocast = False
     mp.spawn(dist_main, args=(config, llm_config), nprocs=config.world_size)
