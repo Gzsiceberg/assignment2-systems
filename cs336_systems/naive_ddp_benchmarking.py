@@ -143,19 +143,17 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
 
 def sync_grads(config, llm):
     if config.flat_grad:
-        # Flatten all gradients into a single tensor
-        grads = [param.grad.view(-1) for param in llm.parameters() if param.grad is not None]
-        flat_grad = torch.cat(grads)
-        dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
-        flat_grad.mul_(1.0 / config.world_size)
+        params_with_grads = [p for p in llm.parameters() if p.grad is not None]
+        if not params_with_grads:
+            return
+        grads = [param.grad for param in params_with_grads]
+        flat_grads = torch._utils._flatten_dense_tensors(grads) # type: ignore
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+        flat_grads.mul_(1.0 / config.world_size)
 
-        # Unflatten the gradients back to their original shapes
-        pointer = 0
-        for param in llm.parameters():
-            if param.grad is not None:
-                numel = param.grad.numel()
-                param.grad.copy_(flat_grad[pointer:pointer + numel].view_as(param.grad))
-                pointer += numel
+        updated_grads = torch._utils._unflatten_dense_tensors(flat_grads, grads) # type: ignore
+        for p, updated_grad in zip(params_with_grads, updated_grads):
+            p.grad = updated_grad
     else:
         for param in llm.parameters():
             if param.grad is None:
