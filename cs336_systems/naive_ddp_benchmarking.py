@@ -117,7 +117,9 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         opt.zero_grad()
 
         if rank == 0 and epoch % 20 == 0:
-            print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}")
+            elapsed = tx() - start
+            per_train_time = elapsed / (epoch + 1 - min(epoch + 1, warmup_epochs))
+            print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}, Per-Train Time: {per_train_time:.4f} seconds")
         if epoch == warmup_epochs - 1:
             if config.backend == "nccl":
                 torch.cuda.synchronize()
