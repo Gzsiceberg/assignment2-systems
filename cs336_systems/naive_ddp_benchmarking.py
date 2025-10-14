@@ -105,10 +105,15 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
 
         # sync gradients
         with torch.no_grad():
-            all_reduce_start = tx()
-            sync_grads(config, llm)
             if config.backend == "nccl":
                 torch.cuda.synchronize()
+
+            all_reduce_start = tx()
+            sync_grads(config, llm)
+
+            if config.backend == "nccl":
+                torch.cuda.synchronize()
+
             all_reduce_end = tx()
             if epoch >= warmup_epochs:
                 all_reduce_times.append(all_reduce_end - all_reduce_start)
