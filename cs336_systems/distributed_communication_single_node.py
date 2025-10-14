@@ -20,7 +20,9 @@ def setup(rank, config: DistributedConfig):
 def dist_demo(rank, config: DistributedConfig):
     setup(rank, config)
 
-    device = torch.device(f'cuda:{rank}' if config.backend == 'nccl' else 'cpu')
+    if config.backend == "nccl":
+        torch.cuda.set_device(rank)
+    device = torch.device(f'cuda' if config.backend == 'nccl' else 'cpu')
     
     data = torch.rand(config.size * 1000_000 // 4, dtype=torch.float32, device=device)
     warmup_iters = 1 if config.backend == "gloo" else 5
