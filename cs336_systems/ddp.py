@@ -79,20 +79,6 @@ class DDPBucketedParameters(torch.nn.Module):
         self.acc_all_reduce_time = 0.0
         return self.module(*args, **kwargs)
     
-    def _handle_last_bucket(self):
-        if self.current_bucketed_size == 0:
-            return
-        start = tx()
-        last_bucket = self.bucketed_params[-1]
-        grads = [param.grad for param in last_bucket if param.grad is not None]
-        flat_grads = torch._utils._flatten_dense_tensors(grads) # type: ignore
-        handle = dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=True)
-        assert handle is not None, f"Expected handle to be not None"
-        self.handles.append((handle, flat_grads, grads, last_bucket))
-        end = tx()
-        self.acc_all_reduce_time += end - start
-        self.bucketed_params.append([])
-
     def finish_gradient_synchronization(self):
         self._handle_last_bucket()
         start = tx()
@@ -128,6 +114,25 @@ class DDPBucketedParameters(torch.nn.Module):
         num_elements = param.numel()
         num_bytes = num_elements * param.element_size()
         self.current_bucketed_size += num_bytes
+    
+    def _handle_last_bucket(self):
+        if self.current_bucketed_size == 0:
+            return
+        start = tx()
+
+        last_bucket = self.bucketed_params[-1]
+        grads = [param.grad for param in last_bucket if param.grad is not None]
+        flat_grads = torch._utils._flatten_dense_tensors(grads) # type: ignore
+        handle = dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=True)
+
+        assert handle is not None, f"Expected handle to be not None"
+        self.handles.append((handle, flat_grads, grads, last_bucket))
+
+        end = tx()
+        self.acc_all_reduce_time += end - start
+
+        self.bucketed_params.append([])
+        self.current_bucketed_size = 0
 
     def _all_reduce_hook(self, param: torch.nn.Parameter) -> None:
         start = tx()
