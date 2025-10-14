@@ -24,6 +24,8 @@ class DDPIndividualParameters(torch.nn.Module):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         start = tx()
         for handle in self.handles:
             handle.wait()
@@ -89,6 +91,8 @@ class DDPBucketedParameters(torch.nn.Module):
     
     def finish_gradient_synchronization(self):
         self._all_reduce_bucket()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         start = tx()
         self.last_bucket_count = len(self.handles)
         for handle, flat_grads, grads, last_bucket in self.handles:

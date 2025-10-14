@@ -113,8 +113,6 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         loss.backward()
 
         if config.ddp:
-            if config.backend == "nccl":
-                torch.cuda.synchronize()
             sync_time = llm.finish_gradient_synchronization() # type: ignore
             if epoch >= warmup_epochs:
                 all_reduce_times.append(sync_time)
