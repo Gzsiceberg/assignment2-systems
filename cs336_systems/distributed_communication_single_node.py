@@ -41,7 +41,7 @@ def dist_demo(rank, config: DistributedConfig):
     avg_time = (end - start) * 1000.0 / iters
     # print(f"Rank {rank}: Average time per iteration: {avg_time:.6f} ms")
 
-    all_times = [torch.zeros(1) for _ in range(config.world_size)]
+    all_times = [torch.zeros(1, device=device) for _ in range(config.world_size)]
     dist.all_gather(all_times, torch.tensor([avg_time], device=device), async_op=False)
 
     if rank == 0:
