@@ -156,16 +156,32 @@ def sync_grads(config, llm):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--backend', type=str, default='gloo', choices=['gloo', 'nccl'], help='Distributed backend to use')
+    parser.add_argument('--flat_grad', action='store_true', help='Enable flat gradient synchronization')
+    args = parser.parse_args()
+
+    if args.backend == "nccl":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available, cannot use NCCL backend")
+        gpus = torch.cuda.device_count()
+        if gpus < 2:
+            raise ValueError("NCCL backend requires at least 2 GPUs")
+
     config = DistributedConfig()
     config.world_size = 2
-    # config.flat_grad = True  # Enable flat gradient synchronization
+    config.backend = args.backend
+    config.flat_grad = args.flat_grad
+
     llm_config = LLMConfig()
-    llm_config.batch_size = 1
-    llm_config.d_model = 8
-    llm_config.num_layers = 2
-    llm_config.num_heads = 1
-    llm_config.context_length = 16
-    llm_config.vocab_size = 32
-    llm_config.lr = 1e-3
-    llm_config.autocast = False
+    if config.backend == "gloo":
+        llm_config.batch_size = 1
+        llm_config.d_model = 8
+        llm_config.num_layers = 2
+        llm_config.num_heads = 1
+        llm_config.context_length = 16
+        llm_config.vocab_size = 32
+        llm_config.lr = 1e-3
+        llm_config.autocast = False
     mp.spawn(dist_main, args=(config, llm_config), nprocs=config.world_size)
