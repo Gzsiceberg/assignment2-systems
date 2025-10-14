@@ -48,7 +48,7 @@ class DDPIndividualParameters(torch.nn.Module):
 
     def _all_reduce_hook(self, param) -> None:
         start = tx()
-        handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
         if handle is not None:
             self.handles.append(handle)
         end = tx()
