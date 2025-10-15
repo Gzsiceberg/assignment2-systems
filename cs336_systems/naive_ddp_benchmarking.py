@@ -11,6 +11,7 @@ from cs336_basics import model
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 from cs336_systems.ddp import DDPBucketedParameters, DDPIndividualParameters
+from cs336_systems.optimizer_state_sharding import OptimizerStateSharding
 
 
 @dataclass
@@ -20,6 +21,7 @@ class DistributedConfig:
     flat_grad: bool = False  # new flag to enable flat gradient synchronization
     ddp: bool = False  # new flag to enable PyTorch DDP
     bucket_size: int = 1  # bucket size in MB for gradient synchronization (only for naive DDP)
+    shard_optim: bool = False  # new flag to enable optimizer state sharding (not implemented yet)
 
 
 @dataclass
@@ -58,10 +60,7 @@ def setup_llm(config: LLMConfig):
         d_ff=4 * d_model,
         rope_theta=rope_theta,
     )
-
-    opt = AdamW(llm.parameters(), lr=config.lr)
-
-    return llm, opt
+    return llm
 
 
 def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
@@ -75,9 +74,13 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     if rank == 0:
         print(f"Config: {config}")
         print(f"LLM Config: {llm_config}")
-    llm, opt = setup_llm(llm_config)
+    llm = setup_llm(llm_config)
     if config.backend == "nccl":
         llm.to(device)
+    if not config.shard_optim:
+        opt = AdamW(llm.parameters(), lr=llm_config.lr)
+    else:
+        opt = OptimizerStateSharding(llm.parameters(), AdamW, lr=llm_config.lr)
     if config.ddp:
         if config.bucket_size > 0:
             llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
@@ -138,7 +141,7 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         if rank == 0 and epoch % 20 == 0 and epoch > warmup_epochs:
             elapsed = tx() - start
             per_train_time = elapsed / (epoch + 1 - min(epoch + 1, warmup_epochs))
-            avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times)
+            avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
             percent_all_reduce = 100.0 * (avg_all_reduce_time / per_train_time)
             debug_info = ""
             if config.ddp:
@@ -153,7 +156,7 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
     end = tx()
     elapsed = end - start
     per_train_time = elapsed / (epochs - warmup_epochs)
-    avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times)
+    avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
     stats = torch.tensor([per_train_time, avg_all_reduce_time], device=device)
     dist.reduce(stats, dst=0, op=dist.ReduceOp.SUM)
     if rank == 0:
@@ -194,6 +197,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--ddp', action='store_true', help='Use PyTorch DDP instead of naive implementation (for comparison)')
     parser.add_argument('--bucket_size', type=int, default=0, help='Bucket size in MB for gradient synchronization (only for naive DDP)')
+    parser.add_argument('--shard_optim', action='store_true', help='Use optimizer state sharding (not implemented yet)')
     args = parser.parse_args()
 
     if args.backend == "nccl":
@@ -209,6 +213,7 @@ if __name__ == "__main__":
     config.flat_grad = args.flat_grad
     config.ddp = args.ddp
     config.bucket_size = args.bucket_size
+    config.shard_optim = args.shard_optim
 
     llm_config = LLMConfig()
     llm_config.batch_size = args.batch_size
