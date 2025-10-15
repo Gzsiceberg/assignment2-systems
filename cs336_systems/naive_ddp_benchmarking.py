@@ -221,7 +221,7 @@ if __name__ == "__main__":
         llm_config.batch_size = 16
         llm_config.d_model = 256
         llm_config.d_ff = 4 * llm_config.d_model
-        llm_config.num_layers = 16
+        llm_config.num_layers = 4
         llm_config.num_heads = 1
         llm_config.context_length = 32
         llm_config.vocab_size = 1000
