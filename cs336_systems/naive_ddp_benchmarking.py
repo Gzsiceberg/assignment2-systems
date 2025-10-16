@@ -64,123 +64,124 @@ def setup_llm(config: LLMConfig):
 
 
 def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
-    setup(rank, config)
-    torch.manual_seed(0 + rank)
-    if config.backend == "nccl":
-        torch.cuda.set_device(rank)
-    device = torch.device(f"cuda" if config.backend == "nccl" else "cpu")
-    context_length = llm_config.context_length
-    batch_size = llm_config.batch_size
-    if rank == 0:
-        print(f"Config: {config}")
-        print(f"LLM Config: {llm_config}")
-    llm = setup_llm(llm_config)
-    if config.backend == "nccl":
-        llm.to(device)
-    if not config.shard_optim:
-        opt = AdamW(llm.parameters(), lr=llm_config.lr)
-    else:
-        opt = OptimizerStateSharding(llm.parameters(), AdamW, lr=llm_config.lr)
-    if rank == 0:
-        total_params = sum(p.numel() for p in llm.parameters())
-        total_params_mem = total_params * 4 / 1e9  # assuming 4 bytes per parameter (float32)
-        print(f"Total parameters: {total_params / 1e6:.2f}M (~{total_params_mem:.2f} GB in float32)")
-        print(f"Using {'NCCL' if config.backend == 'nccl' else 'Gloo'} backend on {config.world_size} processes")
+    try:
+        setup(rank, config)
+        torch.manual_seed(0 + rank)
         if config.backend == "nccl":
-            cuda_mem = torch.cuda.memory_allocated() / 1e9
-            print(f"Initial CUDA memory allocated: {cuda_mem:.2f} GB")
-    if config.ddp:
-        if config.bucket_size > 0:
-            llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
+            torch.cuda.set_device(rank)
+        device = torch.device(f"cuda" if config.backend == "nccl" else "cpu")
+        context_length = llm_config.context_length
+        batch_size = llm_config.batch_size
+        if rank == 0:
+            print(f"Config: {config}")
+            print(f"LLM Config: {llm_config}")
+        llm = setup_llm(llm_config)
+        if config.backend == "nccl":
+            llm.to(device)
+        if not config.shard_optim:
+            opt = AdamW(llm.parameters(), lr=llm_config.lr)
         else:
-            llm = DDPIndividualParameters(llm)
-    else:
-        # sync the model initialization across ranks
-        with torch.no_grad():
-            for param in llm.parameters():
-                dist.broadcast(param, src=0)
-        dist.barrier()
-
-    input_ids = torch.randint(
-        0, llm_config.vocab_size, (batch_size, context_length), device=device
-    )
-    targets = torch.randint(
-        0, llm_config.vocab_size, (batch_size, context_length), device=device
-    )
-    autocast = llm_config.autocast
-
-    start = tx()
-    epochs = 100
-    all_reduce_times = []
-    warmup_epochs = 10
-    for epoch in range(epochs):
-        with (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if autocast
-            else nullcontext()
-        ):
-            logits = llm(input_ids)
-        loss = cross_entropy(logits, targets)
-        loss.backward()
-
-        if config.ddp:
-            sync_time = llm.finish_gradient_synchronization() # type: ignore
-            if epoch >= warmup_epochs:
-                all_reduce_times.append(sync_time)
-        else:
-            # sync gradients
-            with torch.no_grad():
-                if config.backend == "nccl":
-                    torch.cuda.synchronize()
-
-                all_reduce_start = tx()
-                sync_grads(config, llm)
-
-                if config.backend == "nccl":
-                    torch.cuda.synchronize()
-
-                all_reduce_end = tx()
-                if epoch >= warmup_epochs:
-                    all_reduce_times.append(all_reduce_end - all_reduce_start)
-
-        if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
-            cuda_mem = torch.cuda.memory_allocated() / 1e9
-            print(f"CUDA memory allocated before optim step: {cuda_mem:.2f} GB")
-        opt.step()
-        opt.zero_grad()
-        if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
-            cuda_mem = torch.cuda.memory_allocated() / 1e9
-            print(f"CUDA memory allocated after optim step: {cuda_mem:.2f} GB")
-
-        if rank == 0 and epoch % 20 == 0 and epoch > warmup_epochs:
-            elapsed = tx() - start
-            per_train_time = elapsed / (epoch + 1 - min(epoch + 1, warmup_epochs))
-            avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
-            percent_all_reduce = 100.0 * (avg_all_reduce_time / per_train_time)
-            debug_info = ""
-            if config.ddp:
-                debug_info = llm.get_debug_info() # type: ignore
-            print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}, Per-Train Time: {per_train_time:.4f}s Avg All-Reduce Time: {avg_all_reduce_time:.4f}s ({percent_all_reduce:.2f}%) {debug_info}")
-        if epoch == warmup_epochs - 1:
+            opt = OptimizerStateSharding(llm.parameters(), AdamW, lr=llm_config.lr)
+        if rank == 0:
+            total_params = sum(p.numel() for p in llm.parameters())
+            total_params_mem = total_params * 4 / 1e9  # assuming 4 bytes per parameter (float32)
+            print(f"Total parameters: {total_params / 1e6:.2f}M (~{total_params_mem:.2f} GB in float32)")
+            print(f"Using {'NCCL' if config.backend == 'nccl' else 'Gloo'} backend on {config.world_size} processes")
             if config.backend == "nccl":
-                torch.cuda.synchronize()
-            start = tx()  # reset the timer after warmup
-    if config.backend == "nccl":
-        torch.cuda.synchronize()
-    end = tx()
-    elapsed = end - start
-    per_train_time = elapsed / (epochs - warmup_epochs)
-    avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
-    stats = torch.tensor([per_train_time, avg_all_reduce_time], device=device)
-    dist.reduce(stats, dst=0, op=dist.ReduceOp.SUM)
-    if rank == 0:
-        print(f"Average training time per epoch: {stats[0].item() / config.world_size:.4f} seconds")
-        print(f"Average all-reduce time per epoch: {stats[1].item() / config.world_size:.4f} seconds")
-        percent_all_reduce = 100.0 * (stats[1].item() / stats[0].item())
-        print(f"Percentage of time spent in all-reduce: {percent_all_reduce:.2f}%")
+                cuda_mem = torch.cuda.memory_allocated() / 1e9
+                print(f"Initial CUDA memory allocated: {cuda_mem:.2f} GB")
+        if config.ddp:
+            if config.bucket_size > 0:
+                llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
+            else:
+                llm = DDPIndividualParameters(llm)
+        else:
+            # sync the model initialization across ranks
+            with torch.no_grad():
+                for param in llm.parameters():
+                    dist.broadcast(param, src=0)
+            dist.barrier()
 
-    dist.barrier()
-    dist.destroy_process_group()
+        input_ids = torch.randint(
+            0, llm_config.vocab_size, (batch_size, context_length), device=device
+        )
+        targets = torch.randint(
+            0, llm_config.vocab_size, (batch_size, context_length), device=device
+        )
+        autocast = llm_config.autocast
+
+        start = tx()
+        epochs = 100
+        all_reduce_times = []
+        warmup_epochs = 10
+        for epoch in range(epochs):
+            with (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if autocast
+                else nullcontext()
+            ):
+                logits = llm(input_ids)
+            loss = cross_entropy(logits, targets)
+            loss.backward()
+
+            if config.ddp:
+                sync_time = llm.finish_gradient_synchronization() # type: ignore
+                if epoch >= warmup_epochs:
+                    all_reduce_times.append(sync_time)
+            else:
+                # sync gradients
+                with torch.no_grad():
+                    if config.backend == "nccl":
+                        torch.cuda.synchronize()
+
+                    all_reduce_start = tx()
+                    sync_grads(config, llm)
+
+                    if config.backend == "nccl":
+                        torch.cuda.synchronize()
+
+                    all_reduce_end = tx()
+                    if epoch >= warmup_epochs:
+                        all_reduce_times.append(all_reduce_end - all_reduce_start)
+
+            if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
+                cuda_mem = torch.cuda.memory_allocated() / 1e9
+                print(f"CUDA memory allocated before optim step: {cuda_mem:.2f} GB")
+            opt.step()
+            opt.zero_grad()
+            if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
+                cuda_mem = torch.cuda.memory_allocated() / 1e9
+                print(f"CUDA memory allocated after optim step: {cuda_mem:.2f} GB")
+
+            if rank == 0 and epoch % 20 == 0 and epoch > warmup_epochs:
+                elapsed = tx() - start
+                per_train_time = elapsed / (epoch + 1 - min(epoch + 1, warmup_epochs))
+                avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
+                percent_all_reduce = 100.0 * (avg_all_reduce_time / per_train_time)
+                debug_info = ""
+                if config.ddp:
+                    debug_info = llm.get_debug_info() # type: ignore
+                print(f"Rank {rank}, Epoch {epoch}, Loss: {loss.item():.5f}, Per-Train Time: {per_train_time:.4f}s Avg All-Reduce Time: {avg_all_reduce_time:.4f}s ({percent_all_reduce:.2f}%) {debug_info}")
+            if epoch == warmup_epochs - 1:
+                if config.backend == "nccl":
+                    torch.cuda.synchronize()
+                start = tx()  # reset the timer after warmup
+        if config.backend == "nccl":
+            torch.cuda.synchronize()
+        end = tx()
+        elapsed = end - start
+        per_train_time = elapsed / (epochs - warmup_epochs)
+        avg_all_reduce_time = sum(all_reduce_times) / len(all_reduce_times) if all_reduce_times else 0.0
+        stats = torch.tensor([per_train_time, avg_all_reduce_time], device=device)
+        dist.reduce(stats, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            print(f"Average training time per epoch: {stats[0].item() / config.world_size:.4f} seconds")
+            print(f"Average all-reduce time per epoch: {stats[1].item() / config.world_size:.4f} seconds")
+            percent_all_reduce = 100.0 * (stats[1].item() / stats[0].item())
+            print(f"Percentage of time spent in all-reduce: {percent_all_reduce:.2f}%")
+    finally:
+        dist.barrier()
+        dist.destroy_process_group()
 
 def sync_grads(config, llm):
     if config.flat_grad:
