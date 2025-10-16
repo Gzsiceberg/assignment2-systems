@@ -180,8 +180,9 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
             percent_all_reduce = 100.0 * (stats[1].item() / stats[0].item())
             print(f"Percentage of time spent in all-reduce: {percent_all_reduce:.2f}%")
     finally:
-        dist.barrier()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
 def sync_grads(config, llm):
     if config.flat_grad:
