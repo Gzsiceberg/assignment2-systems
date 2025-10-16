@@ -41,11 +41,15 @@ class OptimizerStateSharding(Optimizer):
         total_nums = 0
         current_nums = 0
         # assign params to different ranks in a round-robin manner
+        num_params_per_rank_dict = {i: 0 for i in range(self.world_size)}
         for i, p in enumerate(params):
-            assigned_rank = i % self.world_size
+            keys = list(num_params_per_rank_dict.keys())
+            min_key = min(keys, key=lambda k: num_params_per_rank_dict[k])
+            assigned_rank = min_key
             self.shared_params_groups[assigned_rank].append(p)
             num_params = p.numel()
             total_nums += num_params
+            num_params_per_rank_dict[assigned_rank] += num_params
             if assigned_rank == self.current_rank:
                 current_nums += num_params
         percent = current_nums / total_nums
