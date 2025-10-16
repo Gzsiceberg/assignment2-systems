@@ -25,7 +25,7 @@ class OptimizerStateSharding(Optimizer):
             params = self.shared_params_groups[assigned_rank]
             for p in params:
                 h = dist.broadcast(p, src=assigned_rank, async_op=True)
-                # p.grad = None  # clear the gradient after broadcasting
+                p.grad = None  # clear the gradient after broadcasting
                 if h is not None:
                     all_handles.append(h)
         for h in all_handles:
@@ -34,6 +34,8 @@ class OptimizerStateSharding(Optimizer):
 
     @override   
     def add_param_group(self, param_group: dict[str, Any]):
+        super().add_param_group(param_group)
+
         from rich import print
         params = param_group['params']
         total_nums = 0
@@ -48,9 +50,8 @@ class OptimizerStateSharding(Optimizer):
                 current_nums += num_params
         percent = current_nums / total_nums
         print(f"Rank={self.current_rank}: total_params={total_nums} current_params={current_nums} percent={percent:.2%}")
-        current_rank_params = self.shared_params_groups[self.current_rank]
-        super().add_param_group(param_group)
 
         if self.optimizer:
+            current_rank_params = self.shared_params_groups[self.current_rank]
             param_group = {**param_group, 'params': current_rank_params}
             self.optimizer.add_param_group(param_group)

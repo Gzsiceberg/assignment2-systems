@@ -86,6 +86,9 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         total_params_mem = total_params * 4 / 1e9  # assuming 4 bytes per parameter (float32)
         print(f"Total parameters: {total_params / 1e6:.2f}M (~{total_params_mem:.2f} GB in float32)")
         print(f"Using {'NCCL' if config.backend == 'nccl' else 'Gloo'} backend on {config.world_size} processes")
+        if config.backend == "nccl":
+            cuda_mem = torch.cuda.memory_allocated() / 1e9
+            print(f"Initial CUDA memory allocated: {cuda_mem:.2f} GB")
     if config.ddp:
         if config.bucket_size > 0:
             llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
@@ -140,8 +143,14 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
                 if epoch >= warmup_epochs:
                     all_reduce_times.append(all_reduce_end - all_reduce_start)
 
+        if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
+            cuda_mem = torch.cuda.memory_allocated() / 1e9
+            print(f"CUDA memory allocated before optim step: {cuda_mem:.2f} GB")
         opt.step()
         opt.zero_grad()
+        if rank == 0 and epoch == warmup_epochs - 1 and config.backend == "nccl":
+            cuda_mem = torch.cuda.memory_allocated() / 1e9
+            print(f"CUDA memory allocated after optim step: {cuda_mem:.2f} GB")
 
         if rank == 0 and epoch % 20 == 0 and epoch > warmup_epochs:
             elapsed = tx() - start
