@@ -81,6 +81,11 @@ def dist_main(rank, config: DistributedConfig, llm_config: LLMConfig):
         opt = AdamW(llm.parameters(), lr=llm_config.lr)
     else:
         opt = OptimizerStateSharding(llm.parameters(), AdamW, lr=llm_config.lr)
+    if rank == 0:
+        total_params = sum(p.numel() for p in llm.parameters())
+        total_params_mem = total_params * 4 / 1e9  # assuming 4 bytes per parameter (float32)
+        print(f"Total parameters: {total_params / 1e6:.2f}M (~{total_params_mem:.2f} GB in float32)")
+        print(f"Using {'NCCL' if config.backend == 'nccl' else 'Gloo'} backend on {config.world_size} processes")
     if config.ddp:
         if config.bucket_size > 0:
             llm = DDPBucketedParameters(llm, bucket_size_mb=config.bucket_size)
